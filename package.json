@@ -1,0 +1,23 @@
+{
+  "name": "@codecrafters/claude-code",
+  "description": "Build your own Claude Code challenge, from CodeCrafters",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run app/main.ts",
+    "lint": "oxlint .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "openai": "^6.16.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@oxlint/plugins": "1.81.0",
+    "@types/bun": "latest",
+    "@types/json-schema": "7.0.15",
+    "fast-check": "4.9.0",
+    "oxlint": "1.81.0",
+    "typescript": "7.0.2"
+  }
+}
