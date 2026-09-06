@@ -155,11 +155,9 @@ The harness does not provide automatic tool retries, rollback, exactly-once exec
 
 ## History, sessions, and vocabulary
 
-Terminology follows [Matt Pocock's AI Coding Dictionary](https://github.com/mattpocock/dictionary-of-ai-coding). A session contains turns, and a turn can contain multiple model provider requests. The model generates output. The harness supplies tools, history, and control flow. The configured model and harness form the agent.
+[CONTEXT.md](CONTEXT.md) defines the vocabulary, following [Matt Pocock's AI Coding Dictionary](https://github.com/mattpocock/dictionary-of-ai-coding). A session contains turns, and a turn can contain multiple model provider requests.
 
-Context is task-relevant information. The context window is the token sequence the model sees on a request. The transcript is retained history, which can include messages excluded from the request. This harness sends active messages and tool definitions. It does not supply a system prompt.
-
-The library can fork a lane at an existing entry and start a new session without deleting earlier history:
+The library can fork a lane at an existing entry and start a new session without deleting earlier history. Retained history is separate from the active messages sent to the model:
 
 - `getSnapshot().transcript` returns the complete branch history; `.context` returns only its active messages.
 - `startContextWindow("")` clears accumulated conversation input. Nonempty text initializes the next session with a caller-supplied user message, not a system instruction or verified fact.
@@ -170,7 +168,7 @@ Existing API names are retained. `ConversationSession` names the shared history 
 
 ### Limitations
 
-All history is in memory and grows without bound. There is no persistence, crash recovery, cross-process ownership, queue, cancellation API, streaming, usage accounting, permission UI, sandbox, compaction, or cross-session memory system. Model-provider transport retries and timeouts use the OpenAI SDK defaults. The request budget limits logical model calls. It does not limit shell runtime, output size, token usage, or total spend.
+All history is in memory and grows without bound. There is no persistence, crash recovery, cross-process ownership, queue, cancellation API, streaming, usage accounting, system prompt, permission UI, sandbox, compaction, or cross-session memory system. Model-provider transport retries and timeouts use the OpenAI SDK defaults. The request budget limits logical model calls. It does not limit shell runtime, output size, token usage, or total spend.
 
 ## Development
 
@@ -200,9 +198,8 @@ For challenge submissions, use `codecrafters submit` from your CodeCrafters-link
 
 ## Documentation and help
 
-- [Agent architecture](docs/architecture.md): module map, lane example, history model, and detailed contracts.
+- [Architecture](docs/architecture.md): lane lifecycle, provider and tool contracts, and history selection.
 - [Domain vocabulary](CONTEXT.md): dictionary-aligned terms and project-specific concepts.
-- [Architectural decisions](docs/adr/) and [Pi/Posthorse research](docs/research/pi-lanes-and-context.md): historical rationale, not dependencies or claims of SDK compatibility.
 - [GitHub issues](https://github.com/sanurb/nano-agent-ts/issues): bugs and proposals. Include reproduction steps, your Bun version, and redacted diagnostics—never credentials or private file contents.
 - [CodeCrafters](https://codecrafters.io/): challenge instructions and platform support.
 
