@@ -81,4 +81,4 @@ The latter two are independent learning resources, not official Claude Code spec
 
 [David Urbano (@sanurb)](https://github.com/sanurb) maintains this project. Open a [GitHub issue](https://github.com/sanurb/nano-agent-ts/issues) for questions or proposed changes. Keep changes focused, add tests, and report the checks you ran. Do not share keys, private prompts, or execution journals.
 
-The repository has no license file. A reference project's license does not apply here.
+This project is released under the [MIT License](LICENSE). A reference project's license does not apply here.
