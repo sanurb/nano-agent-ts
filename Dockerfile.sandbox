@@ -1,0 +1,18 @@
+# Supply an audited Bun image by digest, not a floating tag:
+# docker build -f Dockerfile.sandbox --build-arg BUN_IMAGE=oven/bun@sha256:<digest> -t nano-agent-sandbox .
+ARG BUN_IMAGE
+FROM ${BUN_IMAGE}
+USER root
+WORKDIR /agent
+COPY package.json bun.lock ./
+RUN bun install --frozen-lockfile --production --ignore-scripts
+COPY app/agent ./app/agent
+COPY app/session ./app/session
+COPY app/shared ./app/shared
+COPY app/tools ./app/tools
+# Never copy task definitions, reference answers, grading logic, or evaluation reports into the image.
+COPY app/evaluation/candidate-driver.ts app/evaluation/evaluation-protocol.ts ./app/evaluation/
+# Only the trusted supervisor runs as root. It drops groups and starts the worker as the host workspace owner.
+# The runtime grants only SETUID/SETGID, drops all other capabilities, and forbids privilege escalation.
+ENTRYPOINT []
+CMD ["bun", "/agent/app/tools/sandbox-supervisor.ts"]

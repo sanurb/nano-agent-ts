@@ -54,5 +54,5 @@ export type AssistantRequestResult = OperationResult<AssistantResponse, Assistan
 
 /** The model-request capability; implementations own protocol translation and errors. */
 export interface AssistantProvider {
-  requestAssistant(request: AssistantRequest): Promise<AssistantRequestResult>;
+  requestAssistant(request: AssistantRequest, signal?: AbortSignal): Promise<AssistantRequestResult>;
 }

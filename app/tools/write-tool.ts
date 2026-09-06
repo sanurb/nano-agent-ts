@@ -1,13 +1,14 @@
-import { writeFile } from "node:fs/promises";
 import { z } from "zod";
-import type { AgentToolCall } from "../agent/agent-message.ts";
 import type { AgentToolDefinition } from "../agent/assistant-provider.ts";
-import { ToolExecutionError } from "../agent/tool-executor.ts";
-import type { OperationResult } from "../shared/operation-result.ts";
+import { cancelledToolResult, failedToolResult, successfulToolResult, ToolExecutionError } from "../agent/tool-executor.ts";
+import { defineTool } from "./agent-tool.ts";
+import { readFileForMutation, replaceFileAtomically } from "./atomic-file-mutation.ts";
+import { withFileMutationQueue } from "./file-mutation-queue.ts";
+import { pathArgumentSchema } from "./tool-output.ts";
 
 const writeToolArgumentsSchema = z.object({
-  file_path: z.string().min(1).refine((path) => !path.includes("\u0000")),
-  content: z.string(),
+  file_path: pathArgumentSchema,
+  content: z.string().refine((content) => content.isWellFormed()),
 });
 
 /** Advertise Write with required file_path and content, including empty content. */
@@ -25,22 +26,17 @@ export const writeToolDefinition = {
 } satisfies AgentToolDefinition;
 
 /** Create or overwrite a file as UTF-8 without added formatting; parent directories must exist. */
-export async function executeWriteTool(call: AgentToolCall): Promise<OperationResult<string, ToolExecutionError>> {
-  if (call.name !== writeToolDefinition.name) {
-    return { ok: false, error: new ToolExecutionError("unsupported_tool") };
-  }
-  let argumentsValue: unknown;
-  try {
-    argumentsValue = JSON.parse(call.arguments);
-  } catch {
-    return { ok: false, error: new ToolExecutionError("invalid_write_arguments") };
-  }
-  const parsed = writeToolArgumentsSchema.safeParse(argumentsValue);
-  if (!parsed.success) return { ok: false, error: new ToolExecutionError("invalid_write_arguments") };
-
+export const writeTool = defineTool({
+  definition: writeToolDefinition,
+  executionMode: "sequential",
+  argumentsSchema: writeToolArgumentsSchema,
+  argumentsExpectation: "JSON with a nonempty file_path without NUL characters and string content",
   // Parse everything before opening the file; only the filesystem promise's rejection is translated.
-  return writeFile(parsed.data.file_path, parsed.data.content, { encoding: "utf8", flag: "w" }).then(
-    () => ({ ok: true, value: "File written successfully." }) as const,
-    () => ({ ok: false, error: new ToolExecutionError("write_failed") }) as const,
-  );
-}
+  run: (args, signal) => withFileMutationQueue(args.file_path, async (target) => {
+    if (signal?.aborted) return cancelledToolResult();
+    const snapshot = await readFileForMutation(target, signal);
+    if (!snapshot.ok) return failedToolResult(ToolExecutionError.executionFailed(writeToolDefinition.name, "unable to write file"));
+    const committed = await replaceFileAtomically(target, args.content, snapshot.value, signal);
+    return committed.ok && committed.value.status === "success" ? successfulToolResult("File written successfully.") : committed;
+  }, signal),
+});

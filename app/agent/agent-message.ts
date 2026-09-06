@@ -14,12 +14,21 @@ export interface AgentToolCall {
   readonly arguments: string;
 }
 
+/** Provider-reported usage; missing cost is unknown, never zero. No pricing is inferred from a model name. */
+export interface AssistantUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly costCredits?: number;
+}
+
 /** A settled assistant step, including calls that still require tool results. */
 export interface AssistantResponse {
   readonly role: "assistant";
   readonly content: string | null;
   readonly stopReason: "stop" | "tool_use" | "length" | "refusal";
   readonly toolCalls: readonly AgentToolCall[];
+  /** Observed completion metadata, deliberately omitted from provider message replay. */
+  readonly usage?: AssistantUsage;
 }
 
 /** A tool's completed output, correlated with its call within the preceding assistant batch. */

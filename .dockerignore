@@ -1,0 +1,11 @@
+**
+!package.json
+!bun.lock
+!Dockerfile.sandbox
+!app/
+!app/**
+# Tests include reference-solution controls and must not be available to evaluated candidates.
+app/**/*.test.ts
+app/**/.env*
+app/**/*.pem
+app/**/*.key

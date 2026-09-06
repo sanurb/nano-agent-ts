@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { z } from "zod";
-import { toolCallIdSchema, type AgentMessage } from "../agent/agent-message.ts";
+import { toolCallIdSchema, type AgentMessage, type AssistantResponse } from "../agent/agent-message.ts";
 import {
   AssistantRequestFailed,
   InvalidAssistantResponse,
@@ -10,7 +10,20 @@ import {
 } from "../agent/assistant-provider.ts";
 import type { RedactedSecret } from "../shared/redacted-secret.ts";
 
+import { maxToolArgumentCharacters, maxToolNameCharacters } from "../agent/tool-executor.ts";
+
+const maxAssistantContentCharacters = 1_048_576;
+const maxProviderToolCallIdCharacters = 256;
+const maxProviderToolCalls = 4096;
+const assistantRequestDeadlineMs = 60_000;
+const maxAssistantResponseBytes = 2_097_152; // 2 MiB before JSON materialization.
+const maxAssistantOutputTokens = 8192;
+const maxAutomaticProviderRetries = 0; // Retrying a billable request requires explicit caller policy.
+
+const usageSchema = z.object({ prompt_tokens: z.number().int().nonnegative(), completion_tokens: z.number().int().nonnegative(), cost: z.number().nonnegative().optional() });
+
 const completionResponseSchema = z.object({
+  usage: z.unknown().optional(),
   choices: z.array(
     z.object({
       finish_reason: z.enum(["stop", "tool_calls", "length", "content_filter"]).transform(
@@ -18,12 +31,12 @@ const completionResponseSchema = z.object({
       ),
       message: z.object({
         role: z.literal("assistant"),
-        content: z.string().nullable(),
+        content: z.string().max(maxAssistantContentCharacters).nullable(),
         tool_calls: z.array(z.object({
-          id: toolCallIdSchema,
+          id: toolCallIdSchema.refine((id) => id.length <= maxProviderToolCallIdCharacters),
           type: z.literal("function"),
-          function: z.object({ name: z.string().min(1), arguments: z.string() }),
-        })).refine((calls) => new Set(calls.map((call) => call.id)).size === calls.length).default([]),
+          function: z.object({ name: z.string().min(1).max(maxToolNameCharacters), arguments: z.string().max(maxToolArgumentCharacters) }),
+        })).max(maxProviderToolCalls).refine((calls) => new Set(calls.map((call) => call.id)).size === calls.length).default([]),
       }),
     }).refine((choice) => choice.finish_reason !== "tool_use" || choice.message.tool_calls.length > 0),
   ),
@@ -39,18 +52,34 @@ export interface OpenRouterConnection {
 export class OpenRouterProvider implements AssistantProvider {
   readonly #client: OpenAI;
 
-  /** Client construction is inert; retain the SDK's existing timeout and retry defaults. */
+  /** Explicit latency/response budgets and no hidden billable retries; construction remains inert. */
   constructor(connection: OpenRouterConnection) {
     this.#client = new OpenAI({
       apiKey: connection.apiKey.reveal(),
       baseURL: connection.baseURL,
+      timeout: assistantRequestDeadlineMs,
+      maxRetries: maxAutomaticProviderRetries,
+      fetch: async (input, init) => {
+        const response = await fetch(input, init);
+        if (response.body === null) return response;
+        let receivedBytes = 0;
+        const bounded = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, controller) {
+            receivedBytes += chunk.byteLength;
+            if (receivedBytes > maxAssistantResponseBytes) throw new Error("Assistant response exceeded the 2MB transport budget");
+            controller.enqueue(chunk);
+          },
+        }));
+        return new Response(bounded, { status: response.status, statusText: response.statusText, headers: response.headers });
+      },
     });
   }
 
   /** Translate one model request and parse the response before it reaches the harness. */
-  async requestAssistant(request: AssistantRequest): Promise<AssistantRequestResult> {
+  async requestAssistant(request: AssistantRequest, signal?: AbortSignal): Promise<AssistantRequestResult> {
     const payload: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
       model: request.model,
+      max_tokens: maxAssistantOutputTokens,
       messages: request.messages.map(toOpenAIMessage),
     };
     if (request.tools.length > 0) {
@@ -65,7 +94,7 @@ export class OpenRouterProvider implements AssistantProvider {
     }
     // Limit the catch to external work: defects in translation must remain defects.
     const completion = await this.#client.chat.completions
-      .create(payload)
+      .create(payload, { signal })
       .then(
         (response) => ({ ok: true, value: response }) as const,
         (error) => ({
@@ -86,19 +115,15 @@ export class OpenRouterProvider implements AssistantProvider {
     if (!choice) {
       return { ok: false, error: new InvalidAssistantResponse("no_choices") };
     }
-    return {
-      ok: true,
-      value: {
-        role: "assistant",
-        content: choice.message.content,
-        stopReason: choice.finish_reason,
-        toolCalls: choice.message.tool_calls.map((call) => ({
-          id: call.id,
-          name: call.function.name,
-          arguments: call.function.arguments,
-        })),
-      },
-    };
+    const response = {
+      role: "assistant", content: choice.message.content, stopReason: choice.finish_reason,
+      toolCalls: choice.message.tool_calls.map((call) => ({ id: call.id, name: call.function.name, arguments: call.function.arguments })),
+    } satisfies AssistantResponse;
+    const usage = usageSchema.safeParse(parsed.data.usage);
+    if (!usage.success) return { ok: true, value: response };
+    const tokens = { inputTokens: usage.data.prompt_tokens, outputTokens: usage.data.completion_tokens };
+    const measured = usage.data.cost === undefined ? tokens : { ...tokens, costCredits: usage.data.cost };
+    return { ok: true, value: { ...response, usage: measured } };
   }
 }
 

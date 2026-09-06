@@ -3,17 +3,22 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 import type { CliEnvironment } from "./cli/cli-configuration.ts";
 
 const cliPath = fileURLToPath(new URL("./main.ts", import.meta.url));
 const testApiKey = "test-key-never-use-real-credentials";
 
-async function runCli(args: readonly string[], environment: CliEnvironment, cwd = process.cwd()) {
+async function runCli(args: readonly string[], environment: CliEnvironment, cwd = process.cwd(), mode: "sandbox" | "unsafe-local" | "default" = "unsafe-local") {
+  const state = await mkdtemp(join(tmpdir(), "nano-agent-cli-state-"));
   const child = Bun.spawn([process.execPath, "run", cliPath, ...args], {
     cwd,
     env: {
       OPENROUTER_API_KEY: environment.apiKey,
       OPENROUTER_BASE_URL: environment.baseURL,
+      NANO_AGENT_EXECUTION: mode === "default" ? undefined : mode,
+      NANO_AGENT_SANDBOX_IMAGE: "",
+      NANO_AGENT_JOURNAL_PATH: join(state, "journal.sqlite"),
     },
     stdout: "pipe",
     stderr: "pipe",
@@ -27,6 +32,8 @@ async function runCli(args: readonly string[], environment: CliEnvironment, cwd 
     return { stdout, stderr, exitCode };
   } finally {
     child.kill();
+    await child.exited;
+    await rm(state, { recursive: true, force: true });
   }
 }
 
@@ -74,7 +81,16 @@ function completionBody(content: string | null): string {
   });
 }
 
-test("CLI advertises Read, Write, and Bash with the expected schemas and prints only assistant text", async () => {
+const advertisedToolContract = [
+  { name: "Read", properties: ["file_path", "offset", "limit"], required: ["file_path"] },
+  { name: "Glob", properties: ["pattern", "path", "limit"], required: ["pattern"] },
+  { name: "Grep", properties: ["pattern", "path", "glob", "ignore_case", "literal", "limit"], required: ["pattern"] },
+  { name: "Edit", properties: ["file_path", "edits"], required: ["file_path", "edits"] },
+  { name: "Write", properties: ["file_path", "content"], required: ["file_path", "content"] },
+  { name: "Bash", properties: ["command"], required: ["command"] },
+].map((tool) => ({ type: "function", described: true, parameterType: "object", ...tool }));
+
+test("CLI advertises every local tool in wire order and prints only assistant text", async () => {
   using provider = new LocalCompletionServer(completionBody("Hello from the assistant"));
   const prompt = "  Inspect README.md\n日本語 🚀  ";
   const result = await runCli(["-p", prompt, "ignored"], {
@@ -89,51 +105,19 @@ test("CLI advertises Read, Write, and Bash with the expected schemas and prints 
   expect(request.path).toBe("/api/v1/chat/completions");
   expect(request.method).toBe("POST");
   expect(request.authorization).toBe(`Bearer ${testApiKey}`);
-  expect(JSON.parse(request.body)).toEqual({
-    model: "anthropic/claude-haiku-4.5",
-    messages: [{ role: "user", content: prompt }],
-    tools: [{
-      type: "function",
-      function: {
-        name: "Read",
-        description: "Read and return the contents of a file",
-        parameters: {
-          type: "object",
-          properties: {
-            file_path: { type: "string", description: "The path to the file to read" },
-          },
-          required: ["file_path"],
-        },
-      },
-    }, {
-      type: "function",
-      function: {
-        name: "Write",
-        description: "Write content to a file",
-        parameters: {
-          type: "object",
-          required: ["file_path", "content"],
-          properties: {
-            file_path: { type: "string", description: "The path of the file to write to" },
-            content: { type: "string", description: "The content to write to the file" },
-          },
-        },
-      },
-    }, {
-      type: "function",
-      function: {
-        name: "Bash",
-        description: "Execute a shell command",
-        parameters: {
-          type: "object",
-          required: ["command"],
-          properties: {
-            command: { type: "string", description: "The command to execute" },
-          },
-        },
-      },
-    }],
-  });
+  const payload = JSON.parse(request.body);
+  expect(payload.model).toBe("anthropic/claude-haiku-4.5");
+  expect(payload.messages).toEqual([{ role: "user", content: prompt }]);
+  // Descriptions are prompt copy that interpolates the output limits; the wire contract is the envelope,
+  // the advertised order, and each tool's parameter names.
+  expect(payload.tools.map((advertised: any) => ({
+    type: advertised.type,
+    name: advertised.function.name,
+    described: advertised.function.description.length > 0,
+    parameterType: advertised.function.parameters.type,
+    properties: Object.keys(advertised.function.parameters.properties),
+    required: advertised.function.parameters.required,
+  }))).toEqual(advertisedToolContract);
 });
 
 test.each(["", "Line one\nLine two", null])("CLI preserves nullable and multiline content: %j", async (content) => {
@@ -143,11 +127,18 @@ test.each(["", "Line one\nLine two", null])("CLI preserves nullable and multilin
 });
 
 test.each([
-  { name: "relative path without trailing newline", content: "print('Hello, program!')", absolute: false, assistantContent: null },
-  { name: "absolute path and Unicode/CRLF contents", content: "  日本語 🚀\r\n\n", absolute: true, assistantContent: "must not print assistant text" },
-  { name: "empty file", content: "", absolute: false, assistantContent: null },
-  { name: "large file", content: "print('Hello, program!')\n".repeat(8192), absolute: false, assistantContent: null },
-])("CLI sends every Read result to the model and prints only the final answer: $name", async ({ content, absolute, assistantContent }) => {
+  { name: "relative path without trailing newline", content: "print('Hello, program!')", absolute: false, assistantContent: null, expectedResult: undefined },
+  { name: "absolute path and Unicode/CRLF contents", content: "  日本語 🚀\r\n\n", absolute: true, assistantContent: "must not print assistant text", expectedResult: undefined },
+  { name: "empty file", content: "", absolute: false, assistantContent: null, expectedResult: undefined },
+  {
+    name: "large file capped at the line ceiling",
+    content: "print('Hello, program!')\n".repeat(8192),
+    absolute: false,
+    assistantContent: null,
+    expectedResult: `${Array.from({ length: 2000 }, () => "print('Hello, program!')").join("\n")}`
+      + "\n\n[Showing lines 1-2000 of 8193. Use offset=2001 to continue.]",
+  },
+])("CLI sends each Read result to the model and prints only the final answer: $name", async ({ content, absolute, assistantContent, expectedResult }) => {
   const directory = await mkdtemp(join(tmpdir(), "codecrafters-read-"));
   const fileName = absolute ? "strawberry ü ' space.py" : "strawberry.py";
   const filePath = absolute ? join(directory, fileName) : fileName;
@@ -183,7 +174,7 @@ test.each([
     expect(JSON.parse(request.body).messages).toEqual([
       { role: "user", content: "read strawberry.py" },
       toolResponse.choices[0]?.message,
-      { role: "tool", tool_call_id: "read-call", content },
+      { role: "tool", tool_call_id: "read-call", content: expectedResult ?? content },
       { role: "tool", tool_call_id: "second-call", content: "second file contents" },
     ]);
   } finally {
@@ -227,7 +218,16 @@ test("CLI follows README references across multiple agent-loop iterations", asyn
   }
 });
 
-test.each(["Read", "Write", "Bash"])("CLI retains completed %s effects without partial output when continuation fails", async (toolName) => {
+test.each([
+  { toolName: "Read", toolArguments: { file_path: "README.md" }, expected: "must not be printed" },
+  { toolName: "Write", toolArguments: { file_path: "README.md", content: "written contents" }, expected: "written contents" },
+  {
+    toolName: "Edit",
+    toolArguments: { file_path: "README.md", edits: [{ old_string: "must not be printed", new_string: "written contents" }] },
+    expected: "written contents",
+  },
+  { toolName: "Bash", toolArguments: { command: "printf 'written contents' > README.md" }, expected: "written contents" },
+])("CLI retains completed $toolName effects without partial output when continuation fails", async ({ toolName, toolArguments, expected }) => {
   const directory = await mkdtemp(join(tmpdir(), "codecrafters-loop-failure-"));
   try {
     await writeFile(join(directory, "README.md"), "must not be printed");
@@ -238,11 +238,7 @@ test.each(["Read", "Write", "Bash"])("CLI retains completed %s effects without p
           role: "assistant", content: "must not print intermediate text",
           tool_calls: [{ id: "file-call", type: "function", function: {
             name: toolName,
-            arguments: JSON.stringify(toolName === "Write"
-              ? { file_path: "README.md", content: "written contents" }
-              : toolName === "Bash"
-                ? { command: "printf 'written contents' > README.md" }
-                : { file_path: "README.md" }),
+            arguments: JSON.stringify(toolArguments),
           } }],
         },
       }] }),
@@ -252,7 +248,7 @@ test.each(["Read", "Write", "Bash"])("CLI retains completed %s effects without p
       stdout: "", stderr: "no choices in response\n", exitCode: 1,
     });
     expect(provider.requests).toHaveLength(2);
-    expect(await readFile(join(directory, "README.md"), "utf8")).toBe(toolName === "Read" ? "must not be printed" : "written contents");
+    expect(await readFile(join(directory, "README.md"), "utf8")).toBe(expected);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -380,12 +376,37 @@ test("CLI returns a failed command's message to the model instead of ending the 
   }
 });
 
-const invalidReadArgumentsMessage = "Invalid Read arguments: expected JSON with a nonempty file_path without NUL characters";
+test.each([
+  { name: "Edit", bad: { file_path: "source.txt", edits: [{ old_string: "absent", new_string: "new" }] }, good: { file_path: "source.txt", edits: [{ old_string: "old", new_string: "new" }] }, feedback: "Edit tool failed: edits[0] matches no text in the file", output: "Replaced 1 block(s) successfully." },
+  { name: "Read", bad: { file_path: "source.txt", offset: 20 }, good: { file_path: "source.txt", offset: 1 }, feedback: "Read tool failed: offset is past the end of the file", output: "old" },
+  { name: "Glob", bad: { path: "missing", pattern: "*.txt" }, good: { path: ".", pattern: "*.txt" }, feedback: "Glob tool failed: unable to search the requested path", output: "source.txt" },
+])("CLI allows the model to correct a $name miss and retry", async ({ name, bad, good, feedback, output }) => {
+  const directory = await mkdtemp(join(tmpdir(), "codecrafters-tool-retry-"));
+  const toolStep = (args: string) => JSON.stringify({ choices: [{ finish_reason: "tool_calls", message: {
+    role: "assistant", content: null,
+    tool_calls: [{ id: "retry", type: "function", function: { name, arguments: args } }],
+  } }] });
+  try {
+    await writeFile(join(directory, "source.txt"), "old");
+    using provider = new LocalCompletionServer([toolStep(JSON.stringify(bad)), toolStep(JSON.stringify(good)), completionBody("Done")]);
+    expect(await runCli(["-p", "fix the request"], { apiKey: testApiKey, baseURL: provider.baseURL }, directory))
+      .toEqual({ stdout: "Done\n", stderr: "", exitCode: 0 });
+    expect(provider.requests).toHaveLength(3);
+    const [, retry, final] = provider.requests;
+    if (!retry || !final) throw new Error("Tool retry test missing requests");
+    expect(JSON.parse(retry.body).messages.at(-1)).toEqual({ role: "tool", tool_call_id: "retry", content: feedback });
+    expect(JSON.parse(final.body).messages.at(-1)).toEqual({ role: "tool", tool_call_id: "retry", content: output });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+const invalidReadArgumentsMessage =
+  "Invalid Read arguments: expected JSON with a nonempty file_path without NUL characters, plus optional positive offset and limit";
 const invalidBashArgumentsMessage = "Invalid Bash arguments: expected JSON with a nonempty command without NUL characters";
 const invalidWriteArgumentsMessage = "Invalid Write arguments: expected JSON with a nonempty file_path without NUL characters and string content";
 
 test.each([
-  { name: "unsupported tool", toolName: testApiKey, arguments: "{}", message: "Tool execution denied: tool is not active on this lane" },
   { name: "invalid JSON", toolName: "Read", arguments: testApiKey, message: invalidReadArgumentsMessage },
   { name: "null arguments", toolName: "Read", arguments: "null", message: invalidReadArgumentsMessage },
   { name: "array arguments", toolName: "Read", arguments: "[]", message: invalidReadArgumentsMessage },
@@ -405,18 +426,18 @@ test.each([
   { name: "Write missing content", toolName: "Write", arguments: '{"file_path":"protected.py"}', message: invalidWriteArgumentsMessage },
   { name: "Write non-string content", toolName: "Write", arguments: '{"file_path":"protected.py","content":42}', message: invalidWriteArgumentsMessage },
   { name: "Write directory path", toolName: "Write", arguments: '{"file_path":".","content":"new"}', message: "Write tool failed: unable to write file" },
-  { name: "Write missing parent", toolName: "Write", arguments: '{"file_path":"missing/new.py","content":"new"}', message: "Write tool failed: unable to write file" },
+  { name: "Write missing parent", toolName: "Write", arguments: '{"file_path":"missing/new.py","content":"new"}', message: "File mutation tool failed: unable to commit replacement; original file was not replaced" },
   { name: "Bash invalid JSON", toolName: "Bash", arguments: testApiKey, message: invalidBashArgumentsMessage },
   { name: "Bash null arguments", toolName: "Bash", arguments: "null", message: invalidBashArgumentsMessage },
   { name: "Bash missing command", toolName: "Bash", arguments: "{}", message: invalidBashArgumentsMessage },
   { name: "Bash non-string command", toolName: "Bash", arguments: '{"command":42}', message: invalidBashArgumentsMessage },
   { name: "Bash empty command", toolName: "Bash", arguments: '{"command":""}', message: invalidBashArgumentsMessage },
   { name: "Bash NUL command", toolName: "Bash", arguments: JSON.stringify({ command: "rm bad\u0000path" }), message: invalidBashArgumentsMessage },
-])("CLI reports tool failures safely without model continuation: $name", async ({ toolName, arguments: toolArguments, message }) => {
+])("CLI sends correctable tool failures back to the model: $name", async ({ toolName, arguments: toolArguments, message }) => {
   const directory = await mkdtemp(join(tmpdir(), "codecrafters-tool-errors-"));
   try {
     await writeFile(join(directory, "protected.py"), "unchanged");
-    using provider = new LocalCompletionServer(JSON.stringify({
+    using provider = new LocalCompletionServer([JSON.stringify({
       choices: [{
         message: {
           role: "assistant", content: "must not print fallback text",
@@ -424,15 +445,29 @@ test.each([
         },
         finish_reason: "tool_calls",
       }],
-    }));
+    }), completionBody("Recovered")]);
     const result = await runCli(["-p", "read a file"], { apiKey: testApiKey, baseURL: provider.baseURL }, directory);
-    expect(result).toEqual({ stdout: "", stderr: `${message}\n`, exitCode: 1 });
-    expect(result.stderr).not.toContain(testApiKey);
-    expect(provider.requests).toHaveLength(1);
+    expect(result).toEqual({ stdout: "Recovered\n", stderr: "", exitCode: 0 });
+    expect(provider.requests).toHaveLength(2);
+    const continuation = provider.requests[1];
+    if (!continuation) throw new Error("Tool recovery test missing continuation");
+    expect(JSON.parse(continuation.body).messages.at(-1)).toEqual({ role: "tool", tool_call_id: "tool-call", content: message });
+    expect(message).not.toContain(testApiKey);
     expect(await readFile(join(directory, "protected.py"), "utf8")).toBe("unchanged");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("CLI rejects unadvertised tool admission without continuing or exposing the requested name", async () => {
+  using provider = new LocalCompletionServer(JSON.stringify({ choices: [{ finish_reason: "tool_calls", message: {
+    role: "assistant", content: null,
+    tool_calls: [{ id: "denied", type: "function", function: { name: testApiKey, arguments: "{}" } }],
+  } }] }));
+  expect(await runCli(["-p", "run a tool"], { apiKey: testApiKey, baseURL: provider.baseURL })).toEqual({
+    stdout: "", stderr: "Tool execution denied: tool is not active on this lane\n", exitCode: 1,
+  });
+  expect(provider.requests).toHaveLength(1);
 });
 
 test.each([
@@ -451,6 +486,63 @@ test("CLI reports HTTP errors without exposing provider bodies or credentials", 
   const result = await runCli(["-p", "hello"], { apiKey: testApiKey, baseURL: provider.baseURL });
   expect(result).toEqual({ stdout: "", stderr: "Assistant request failed: HTTP 401\n", exitCode: 1 });
   expect(result.stderr).not.toContain(testApiKey);
+});
+
+test("CLI interruption kills a Bash descendant that ignores SIGTERM before exiting", async () => {
+  const ready = Promise.withResolvers<number>();
+  let requests = 0;
+  let command = "";
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: async (request) => {
+    if (new URL(request.url).pathname === "/ready") {
+      ready.resolve(z.coerce.number().int().positive().parse(await request.text()));
+      return new Response("ready");
+    }
+    requests++;
+    return new Response(JSON.stringify({ choices: [{ finish_reason: "tool_calls", message: {
+      role: "assistant", content: null,
+      tool_calls: [{ id: "long-command", type: "function", function: { name: "Bash", arguments: JSON.stringify({ command }) } }],
+    } }] }), { headers: { "content-type": "application/json" } });
+  } });
+  const script = `process.on('SIGTERM', () => {}); setInterval(() => {}, 1000); await fetch(${JSON.stringify(`${server.url}ready`)}, {method: 'POST', body: String(process.pid)});`;
+  command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)} & wait`;
+  const state = await mkdtemp(join(tmpdir(), "nano-agent-cli-cancel-state-"));
+  const child = Bun.spawn([process.execPath, "run", cliPath, "-p", "run until interrupted"], {
+    env: { OPENROUTER_API_KEY: testApiKey, OPENROUTER_BASE_URL: `${server.url}api/v1`, NANO_AGENT_EXECUTION: "unsafe-local", NANO_AGENT_JOURNAL_PATH: join(state, "journal.sqlite") },
+    stdout: "pipe", stderr: "pipe",
+  });
+  const timeout = setTimeout(() => ready.reject(new Error("Bash cancellation test readiness timed out")), 4000);
+  let descendant: number | undefined;
+  try {
+    descendant = await ready.promise;
+    child.kill("SIGINT");
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+    ]);
+    expect({ stdout, stderr, exitCode }).toEqual({
+      stdout: "", stderr: "Agent run cancelled: in-flight work settled; inspect interrupted effects before retrying\n", exitCode: 130,
+    });
+    expect(requests).toBe(1);
+    const pid = descendant;
+    expect(() => process.kill(pid, 0)).toThrow();
+  } finally {
+    clearTimeout(timeout);
+    child.kill();
+    if (descendant !== undefined) {
+      try { process.kill(descendant, "SIGKILL"); } catch { /* Already reaped is the expected successful path. */ }
+    }
+    server.stop(true);
+    await child.exited;
+    await rm(state, { recursive: true, force: true });
+  }
+}, 10_000);
+
+test("CLI requires configured isolation by default and never falls back or contacts the provider", async () => {
+  using provider = new LocalCompletionServer(completionBody("must not run"));
+  const result = await runCli(["-p", "perform a task"], { apiKey: testApiKey, baseURL: provider.baseURL }, process.cwd(), "default");
+  expect(result.exitCode).toBe(1);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toContain("configure a digest-pinned sandbox image");
+  expect(provider.requests).toHaveLength(0);
 });
 
 test("CLI reports a provider connection failure as a safe diagnostic", async () => {
