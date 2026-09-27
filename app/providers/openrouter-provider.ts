@@ -80,7 +80,7 @@ export class OpenRouterProvider implements AssistantProvider {
     const payload: OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming = {
       model: request.model,
       max_tokens: maxAssistantOutputTokens,
-      messages: request.messages.map(toOpenAIMessage),
+      messages: [{ role: "system", content: request.instructions.text }, ...request.messages.map(toOpenAIMessage)],
     };
     if (request.tools.length > 0) {
       payload.tools = request.tools.map((tool) => ({

@@ -1,6 +1,7 @@
 import type { JSONSchema7 } from "json-schema";
 import type { OperationResult } from "../shared/operation-result.ts";
 import type { AgentMessage, AssistantResponse } from "./agent-message.ts";
+import type { AgentInstructions } from "./agent-instructions.ts";
 
 /** A tool advertisement in standard JSON Schema, independent of provider envelopes. */
 export interface AgentToolDefinition {
@@ -12,8 +13,20 @@ export interface AgentToolDefinition {
 /** One assistant request; the caller owns context and tool selection. */
 export interface AssistantRequest {
   readonly model: string;
+  readonly instructions: AgentInstructions;
   readonly messages: readonly AgentMessage[];
   readonly tools: readonly AgentToolDefinition[];
+}
+
+/** Provider-neutral budgeting material contains raw instructions; never use it as diagnostic metadata. */
+export interface AssistantRequestBudgetInput extends Omit<AssistantRequest, "instructions"> {
+  readonly instructions: string;
+}
+
+/** Shared input for request-size accounting and future tokenizer adapters; explicitly includes private instruction text. */
+export function assistantRequestBudgetInput(request: AssistantRequest): AssistantRequestBudgetInput {
+  // Do not JSON.stringify(request): instructions intentionally serialize to metadata for safe diagnostics.
+  return { model: request.model, instructions: request.instructions.text, messages: request.messages, tools: request.tools };
 }
 
 /** A provider failure safe to render without leaking response bodies or credentials. */

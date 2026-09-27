@@ -6,6 +6,7 @@ A coding agent built with TypeScript and Bun. This is my project for learning ho
 
 - [Can work run concurrently in one session?](docs/adr/0002-session-branch-lane-ownership.md) Why run ownership belongs to lanes, the alternatives, and how this relates to Pi 2.
 - [Why not serialize the whole tool batch?](docs/adr/0001-adjacent-tool-groups.md) The trade-off between adjacent parallel groups and dependency scheduling.
+- [Why are instructions separate from conversation?](docs/adr/0003-lane-instruction-contract.md) Immutable policy, capability facts, and separate delivery/effectiveness verification.
 
 ## Develop
 
@@ -50,11 +51,12 @@ For configuration, start with [CLI input](app/cli/cli-configuration.ts) and [exe
 | Sessions and branches | [conversation-session.ts](app/session/conversation-session.ts) |
 | Lane ownership and concurrency | [agent-harness.ts](app/agent/agent-harness.ts), [tests](app/agent/agent-harness.test.ts) |
 | Agent loop and tool scheduling | [agent-lane.ts](app/agent/agent-lane.ts), [batch tests](app/agent/tool-batch.test.ts) |
+| Instruction admission, policy, and composition | [agent-instructions.ts](app/agent/agent-instructions.ts), [delivery tests](app/agent/agent-instructions.test.ts) |
 | Provider integration | [openrouter-provider.ts](app/providers/openrouter-provider.ts) |
 | Tool registration and execution | [local-tools.ts](app/tools/local-tools.ts), [app/tools/](app/tools/) |
 | File mutation coordination | [file-mutation-queue.ts](app/tools/file-mutation-queue.ts), [atomic-file-mutation.ts](app/tools/atomic-file-mutation.ts) |
 | Tool evidence and recovery | [journaled-tool-executor.ts](app/agent/journaled-tool-executor.ts), [sqlite-execution-journal.ts](app/session/sqlite-execution-journal.ts) |
-| Evaluations | [app/evaluation/main.ts](app/evaluation/main.ts) |
+| Evaluations | [app/evaluation/main.ts](app/evaluation/main.ts), [authorized instruction trials](docs/adr/0003-lane-instruction-contract.md#delivery-evidence-is-not-effectiveness-evidence) |
 | Compiler and lint rules | [tsconfig.json](tsconfig.json), [.oxlintrc.json](.oxlintrc.json) |
 
 ## Documentation

@@ -46,7 +46,14 @@ test.skipIf(image === undefined)("real Docker isolates host files, credentials, 
     await writeFile(join(workspace, "source.txt"), "original");
     const sandbox = await DockerToolExecutor.create(workspace, image);
     if (!sandbox.ok) throw sandbox.error;
+    const capabilities = sandbox.value.describeCapabilities?.() ?? [];
+    expect(capabilities.find((fact) => fact.toolName === "Bash")?.description).toContain("workspace is mounted read-only");
+    expect(capabilities.find((fact) => fact.toolName === "Bash")?.description).toContain("ephemeral /tmp");
+    expect(capabilities.find((fact) => fact.toolName === "Write")?.description).toContain("persists on the host workspace");
     const call = async (name: string, args: SandboxTestArguments) => sandbox.value.executeTool({ id: toolCallIdSchema.parse("sandbox-test"), name, arguments: JSON.stringify(args) });
+    expect(await call("Bash", { command: "printf ephemeral > /tmp/instruction-capability-proof" })).toMatchObject({ ok: true, value: { status: "success" } });
+    expect(await call("Bash", { command: "test ! -e /tmp/instruction-capability-proof && echo fresh-container" }))
+      .toMatchObject({ ok: true, value: { status: "success", content: "fresh-container\n" } });
     expect(await call("Write", { file_path: "source.txt", content: "authorized" })).toMatchObject({ ok: true, value: { status: "success" } });
     expect(await readFile(join(workspace, "source.txt"), "utf8")).toBe("authorized");
     expect(await call("Read", { file_path: join(root, "host-secret") })).toMatchObject({ ok: false, error: { reason: "policy_denied" } });

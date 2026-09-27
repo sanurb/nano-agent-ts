@@ -1,10 +1,16 @@
 import { expect, test } from "bun:test";
 import { AgentHarness } from "../agent/agent-harness.ts";
+import { AgentInstructions, codingAgentInstructions } from "../agent/agent-instructions.ts";
 import { toolCallIdSchema } from "../agent/agent-message.ts";
 import { RedactedSecret } from "../shared/redacted-secret.ts";
 import { LocalToolExecutor } from "../tools/local-tool-executor.ts";
 import { readToolDefinition } from "../tools/read-tool.ts";
 import { OpenRouterProvider } from "./openrouter-provider.ts";
+
+const composed = AgentInstructions.compose(codingAgentInstructions, []);
+if (!composed.ok) throw composed.error;
+const instructions = composed.value;
+const systemMessage = { role: "system", content: instructions.text };
 
 const readToolCall = {
   id: "call_read",
@@ -43,6 +49,7 @@ test("real SDK replays assistant history, preserves tool calls, and leaves conti
     });
     expect(requests[1]).toMatchObject({
       messages: [
+        systemMessage,
         { role: "user", content: "First question" },
         { role: "assistant", content: "First answer" },
         { role: "user", content: "Read the file" },
@@ -63,7 +70,7 @@ test("provider response bytes are bounded before JSON materialization and overfl
   } });
   try {
     const provider = new OpenRouterProvider({ apiKey: new RedactedSecret("test-key"), baseURL: server.url.href });
-    expect(await provider.requestAssistant({ model: "test", messages: [], tools: [] })).toMatchObject({ ok: false });
+    expect(await provider.requestAssistant({ model: "test", instructions, messages: [], tools: [] })).toMatchObject({ ok: false });
     expect(requests).toBe(1);
   } finally { server.stop(true); }
 });
@@ -76,13 +83,13 @@ test("provider usage is measured without inventing missing cost or leaking metad
   } });
   try {
     const provider = new OpenRouterProvider({ apiKey: new RedactedSecret("test-key"), baseURL: server.url.href });
-    const first = await provider.requestAssistant({ model: "test", messages: [], tools: [] });
+    const first = await provider.requestAssistant({ model: "test", instructions, messages: [], tools: [] });
     if (!first.ok) throw first.error;
     expect(first.value.usage).toEqual({ inputTokens: 12, outputTokens: 3 });
-    await provider.requestAssistant({ model: "test", messages: [first.value], tools: [] });
+    await provider.requestAssistant({ model: "test", instructions, messages: [first.value], tools: [] });
     const replay = requests[1];
     if (!replay) throw new Error("Missing provider replay request");
-    expect(JSON.parse(replay).messages).toEqual([{ role: "assistant", content: "done" }]);
+    expect(JSON.parse(replay).messages).toEqual([systemMessage, { role: "assistant", content: "done" }]);
   } finally { server.stop(true); }
 });
 
@@ -128,7 +135,7 @@ test.each([
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => Response.json({ choices: [choice] }) });
   try {
     const provider = new OpenRouterProvider({ apiKey: new RedactedSecret("test-key"), baseURL: server.url.href });
-    expect(await provider.requestAssistant({ model: "test", messages: [{ role: "user", content: "hello" }], tools: [] })).toMatchObject({
+    expect(await provider.requestAssistant({ model: "test", instructions, messages: [{ role: "user", content: "hello" }], tools: [] })).toMatchObject({
       ok: false, error: { _tag: "InvalidAssistantResponse", reason: "malformed_response" },
     });
   } finally {
@@ -152,10 +159,10 @@ test.each([
   });
   try {
     const provider = new OpenRouterProvider({ apiKey: new RedactedSecret("test-key"), baseURL: server.url.href });
-    expect(await provider.requestAssistant({ model: "test", messages: [{ role: "user", content: "hello" }], tools: [] })).toEqual({
+    expect(await provider.requestAssistant({ model: "test", instructions, messages: [{ role: "user", content: "hello" }], tools: [] })).toEqual({
       ok: true, value: { role: "assistant", content: null, stopReason, toolCalls: [] },
     });
-    expect(requests).toEqual([{ model: "test", max_tokens: 8192, messages: [{ role: "user", content: "hello" }] }]);
+    expect(requests).toEqual([{ model: "test", max_tokens: 8192, messages: [systemMessage, { role: "user", content: "hello" }] }]);
   } finally {
     await server.stop(true);
   }

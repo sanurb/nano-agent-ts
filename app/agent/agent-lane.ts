@@ -6,10 +6,13 @@ import type {
 } from "../session/conversation-session.ts";
 import type { OperationResult } from "../shared/operation-result.ts";
 import type { AgentMessage, AgentToolCall, AssistantResponse, ToolCallId } from "./agent-message.ts";
+import { assistantRequestBudgetInput } from "./assistant-provider.ts";
+import type { AgentInstructionContract, AgentInstructions, InstructionMetadata } from "./agent-instructions.ts";
 import type {
   AgentToolDefinition,
   AssistantProvider,
   AssistantProviderError,
+  AssistantRequest,
   AssistantRequestResult,
 } from "./assistant-provider.ts";
 import { cancelledToolResult, failedToolResult, ToolExecutionError, type AgentToolExecutor, type ToolOutcome } from "./tool-executor.ts";
@@ -44,6 +47,7 @@ export interface AgentRunOptions {
   readonly maxParallelTools?: number;
   readonly maxToolCalls?: number;
   readonly maxDurationMs?: number;
+  /** UTF-8 bytes of neutral request material, including instructions and tools; not a provider token count. */
   readonly maxContextBytes?: number;
   /** Stop new work and propagate interruption to in-flight effects; the lane stays owned until settlement. */
   readonly signal?: AbortSignal;
@@ -111,10 +115,23 @@ export type AgentRunResult = OperationResult<
   LaneAdmissionError | AssistantProviderError | ToolExecutionError | AgentRunLimitExceeded | AgentRunCancelled | AgentGenerationRejected | AgentRunBudgetExceeded | AgentEffectUncertain
 >;
 
-/** Each lane captures its own model and active tool advertisements at creation. */
+/** Creation-only model, tool advertisements, and application instruction contract; never populated from conversation text. */
 export interface AgentLaneConfiguration {
   readonly model: string;
   readonly tools: readonly AgentToolDefinition[];
+  /** Creation-only application rules; omission inherits captured harness defaults, never branch history. */
+  readonly instructions?: AgentInstructionContract;
+}
+
+/** Only admitted, composed instructions reach a lane's immutable runtime configuration. */
+export interface ResolvedAgentLaneConfiguration extends Omit<AgentLaneConfiguration, "instructions"> {
+  readonly instructions: AgentInstructions;
+}
+
+/** Latest accepted run/request identity is private in-memory metadata, not conversation or durable recovery state. */
+export interface AgentRunMetadata {
+  readonly instructions: InstructionMetadata;
+  readonly assistantRequests: number;
 }
 
 const laneAdmissionMessages = {
@@ -138,31 +155,34 @@ export class LaneAdmissionError extends Error {
 }
 
 /** Admission failures create no entries; provider failures retain the accepted user entry. */
-export type LaneRequestResult = OperationResult<AssistantResponse, AssistantProviderError | LaneAdmissionError>;
+export type LaneRequestResult = OperationResult<AssistantResponse, AssistantProviderError | LaneAdmissionError | AgentRunBudgetExceeded>;
 
 /** One atomic in-process observation; callers receive copies, not mutable session references. */
 export interface AgentLaneSnapshot {
   readonly name: string;
   readonly tipId: SessionEntryId | null;
   readonly status: "idle" | "requesting" | "awaiting_tools";
-  readonly configuration: AgentLaneConfiguration;
+  readonly configuration: Omit<AgentLaneConfiguration, "instructions">;
+  readonly instructionMetadata: InstructionMetadata;
+  readonly runMetadata: AgentRunMetadata | null;
   readonly transcript: readonly ConversationEntry[];
   readonly context: readonly AgentMessage[];
 }
 
 /** One branch plus exclusive request ownership; unrelated lanes never wait on its provider. */
 export class AgentLane {
-  readonly #configuration: AgentLaneConfiguration;
+  readonly #configuration: ResolvedAgentLaneConfiguration;
+  #runMetadata: AgentRunMetadata | null = null;
   #status: "idle" | "requesting" = "idle";
 
   /** Only the harness constructs lanes; it never exposes the underlying mutable branch. */
   constructor(
     private readonly branch: ConversationBranch,
     private readonly provider: AssistantProvider,
-    configuration: AgentLaneConfiguration,
+    configuration: ResolvedAgentLaneConfiguration,
     private readonly toolExecutor: AgentToolExecutor | null,
   ) {
-    this.#configuration = structuredClone(configuration);
+    this.#configuration = { ...structuredClone({ model: configuration.model, tools: configuration.tools }), instructions: configuration.instructions };
   }
 
   /** Stable lane identity; names are not roles or permission grants. */
@@ -175,6 +195,10 @@ export class AgentLane {
     const rejected = this.admissionError();
     if (rejected) return { ok: false, error: rejected };
     if (!prompt) return { ok: false, error: new LaneAdmissionError("empty_prompt") };
+    if (this.requestBytes([...this.branch.getContext(), { role: "user", content: prompt }]) > defaultContextBytes) {
+      return { ok: false, error: new AgentRunBudgetExceeded("context") };
+    }
+    this.#runMetadata = { instructions: this.#configuration.instructions.metadata, assistantRequests: 0 };
     this.#status = "requesting";
     try {
       this.branch.appendMessage({ role: "user", content: prompt });
@@ -195,12 +219,13 @@ export class AgentLane {
     const interruption = (): AgentRunResult => ({ ok: false, error: deadline.signal.aborted
       ? new AgentRunBudgetExceeded("time") : new AgentRunCancelled() });
     let toolCalls = 0;
+    this.#runMetadata = { instructions: this.#configuration.instructions.metadata, assistantRequests: 0 };
     this.#status = "requesting";
     try {
       this.branch.appendMessage({ role: "user", content: prompt });
       for (let step = 0; step < maxAssistantSteps; step++) {
         if (signal.aborted) return interruption();
-        if (Buffer.byteLength(JSON.stringify(this.branch.getContext()), "utf8") > limits.maxContextBytes) {
+        if (this.requestBytes(this.branch.getContext()) > limits.maxContextBytes) {
           return { ok: false, error: new AgentRunBudgetExceeded("context") };
         }
         const response = await this.requestStep(signal);
@@ -238,7 +263,7 @@ export class AgentLane {
     const limits = runLimitsSchema.safeParse(options);
     if (!limits.success) return { ok: false, error: new LaneAdmissionError("invalid_run_limits") };
     if (options.signal?.aborted) return { ok: false, error: new AgentRunCancelled() };
-    if (Buffer.byteLength(prompt, "utf8") > limits.data.maxContextBytes) return { ok: false, error: new AgentRunBudgetExceeded("context") };
+    if (this.requestBytes([...this.branch.getContext(), { role: "user", content: prompt }]) > limits.data.maxContextBytes) return { ok: false, error: new AgentRunBudgetExceeded("context") };
     return { ok: true, value: { executor, maxAssistantSteps: steps.data, limits: limits.data } };
   }
 
@@ -276,7 +301,9 @@ export class AgentLane {
       name: this.name,
       tipId: this.branch.getTipId(),
       status: this.#status === "requesting" ? "requesting" : this.hasPendingToolCalls(context) ? "awaiting_tools" : "idle",
-      configuration: structuredClone(this.#configuration),
+      configuration: structuredClone({ model: this.#configuration.model, tools: this.#configuration.tools }),
+      instructionMetadata: this.#configuration.instructions.metadata,
+      runMetadata: this.#runMetadata === null ? null : structuredClone(this.#runMetadata),
       transcript: this.branch.getEntries(),
       context,
     };
@@ -341,12 +368,19 @@ export class AgentLane {
     return { ok: true, value: outcomes };
   }
 
+  private createRequest(messages: readonly AgentMessage[]): AssistantRequest {
+    return { model: this.#configuration.model, instructions: this.#configuration.instructions,
+      tools: structuredClone(this.#configuration.tools), messages };
+  }
+
+  private requestBytes(messages: readonly AgentMessage[]): number {
+    return Buffer.byteLength(JSON.stringify(assistantRequestBudgetInput(this.createRequest(messages))), "utf8");
+  }
+
   private async requestStep(signal?: AbortSignal): Promise<AssistantRequestResult> {
-    const result = await this.provider.requestAssistant({
-      model: this.#configuration.model,
-      tools: structuredClone(this.#configuration.tools),
-      messages: this.branch.getContext(),
-    }, signal);
+    this.#runMetadata = { instructions: this.#configuration.instructions.metadata,
+      assistantRequests: (this.#runMetadata?.assistantRequests ?? 0) + 1 };
+    const result = await this.provider.requestAssistant(this.createRequest(this.branch.getContext()), signal);
     if (result.ok) this.branch.appendMessage(result.value);
     return result;
   }

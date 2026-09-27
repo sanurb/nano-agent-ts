@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { parseArgs } from "node:util";
 import { z } from "zod";
 import { AgentHarness } from "../agent/agent-harness.ts";
+import { codingAgentInstructions, type AgentInstructionContract } from "../agent/agent-instructions.ts";
 import { JournaledToolExecutor } from "../agent/journaled-tool-executor.ts";
 import type { ExecutionJournalError } from "../agent/tool-execution-journal.ts";
 import type { AssistantProvider } from "../agent/assistant-provider.ts";
@@ -16,11 +17,12 @@ import { DockerToolExecutor } from "../tools/docker-tool-executor.ts";
 import { localTools } from "../tools/local-tools.ts";
 import { privateDirectoryMode, privateFileMode } from "../shared/file-permissions.ts";
 import { interruptedExitCode } from "../shared/process-policy.ts";
-import { codingEvaluationTasks, type CodingEvaluationTask } from "./coding-tasks.ts";
+import { codingEvaluationTasks } from "./coding-tasks.ts";
+import { gradeInstructionTrial, instructionEvaluationTasks, instructionTrialPolicies, type InstructionEvaluationTask, type InstructionTrialGrade } from "./instruction-trials.ts";
 import { fingerprintWorkspace, gradeCodingTask, unexpectedChanges } from "./coding-grader.ts";
 import { evaluationJsonIndentSpaces, writeEvaluationArtifact } from "./evaluation-artifact.ts";
 
-const evaluationManifestVersion = 1;
+const evaluationManifestVersion = 2;
 const maxEvaluationModelCharacters = 256;
 const maxEvaluationOutputPathCharacters = 4096;
 const minimumEvaluationRequests = 6; // One step for each of three tasks under both policies.
@@ -34,6 +36,7 @@ type EvaluationPolicy = typeof policies[number];
 
 const optionsSchema = z.object({
   "allow-live": z.literal(true),
+  suite: z.enum(["coding", "instructions"]).default("coding"),
   model: z.string().min(1).max(maxEvaluationModelCharacters),
   output: z.string().min(1).max(maxEvaluationOutputPathCharacters),
   "max-requests": z.coerce.number().int().min(minimumEvaluationRequests).max(maximumEvaluationRequests),
@@ -51,7 +54,9 @@ interface PolicyMeasurements {
 
 interface EvaluationTrial {
   readonly directory: string;
-  readonly task: CodingEvaluationTask;
+  readonly task: InstructionEvaluationTask;
+  readonly instructions: AgentInstructionContract;
+  readonly suite: "coding" | "instructions";
   readonly policy: EvaluationPolicy;
   readonly repetition: number;
   readonly model: string;
@@ -61,6 +66,7 @@ interface EvaluationTrial {
 }
 
 interface TrialMeasurements {
+  readonly instructionGrade: InstructionTrialGrade | null;
   readonly verified: boolean;
   readonly requests: number;
   readonly agentDurationMs: number;
@@ -123,13 +129,14 @@ async function runEvaluationTrial(trial: EvaluationTrial, provider: AssistantPro
   // Cleanup starts immediately after acquisition, including failed harness/lane construction.
   const perform = async () => {
     const execution: AgentToolExecutor = {
+      describeCapabilities: () => sandbox.value.describeCapabilities?.() ?? [],
       executionModeFor: (name) => trial.policy === "serial" ? "sequential" : sandbox.value.executionModeFor(name),
       executeTool: (call, abort, context) => sandbox.value.executeTool(call, abort, context),
     };
     const measured = measureProviderRequests(provider);
     const { usage } = measured;
     const harness = new AgentHarness(measured.provider, {
-      model: trial.model, tools: localTools.map((tool) => tool.definition), entryIds: { next: () => Bun.randomUUIDv7() },
+      model: trial.model, instructions: trial.instructions, tools: localTools.map((tool) => tool.definition), entryIds: { next: () => Bun.randomUUIDv7() },
     }, new JournaledToolExecutor(execution, journal));
     const lane = await harness.lane("evaluation");
     if (!lane.ok) throw lane.error;
@@ -144,18 +151,22 @@ async function runEvaluationTrial(trial: EvaluationTrial, provider: AssistantPro
       const unexpected = unexpectedChanges(baseline, await fingerprintWorkspace(workspace), task.allowedChanges);
       const verified = grade.verified && unexpected.length === 0;
       const costCredits = usage.costResponses === usage.requests ? usage.credits : null;
+      const snapshot = await lane.value.getSnapshot();
+      const instructionGrade = trial.suite === "instructions" ? gradeInstructionTrial(task, snapshot.transcript, unexpected) : null;
       await writeEvaluationArtifact(join(trial.directory, "result.json"), JSON.stringify({
         task: task.id, policy: trial.policy, repetition: trial.repetition, verified, grade, unexpectedChanges: unexpected,
+        instructionMetadata: snapshot.instructionMetadata, runMetadata: snapshot.runMetadata, instructionGrade,
         runStatus: result.ok ? result.value.stopReason : result.error._tag, agentDurationMs, modelRequests: usage.requests,
         inputTokens: usage.tokenResponses === usage.requests ? usage.inputTokens : null,
         outputTokens: usage.tokenResponses === usage.requests ? usage.outputTokens : null, costCredits,
       }, null, evaluationJsonIndentSpaces));
-      return { verified, requests: usage.requests, agentDurationMs, costCredits };
+      return { verified, requests: usage.requests, agentDurationMs, costCredits, instructionGrade };
     } finally {
       const snapshot = await lane.value.getSnapshot();
       await writeEvaluationArtifact(join(trial.directory, "trace.json"), JSON.stringify({
         name: snapshot.name, tipId: snapshot.tipId, status: snapshot.status,
-        configuration: snapshot.configuration, transcript: snapshot.transcript,
+        configuration: snapshot.configuration, instructionMetadata: snapshot.instructionMetadata,
+        runMetadata: snapshot.runMetadata, transcript: snapshot.transcript,
       }, null, evaluationJsonIndentSpaces));
     }
   };
@@ -170,23 +181,29 @@ async function runEvaluationTrial(trial: EvaluationTrial, provider: AssistantPro
 async function runEvaluation(signal: AbortSignal): Promise<void> {
   const args = parseArgs({
     options: {
-      "allow-live": { type: "boolean" }, model: { type: "string" }, output: { type: "string" },
+      "allow-live": { type: "boolean" }, suite: { type: "string" }, model: { type: "string" }, output: { type: "string" },
       "max-requests": { type: "string" }, seed: { type: "string" }, repeats: { type: "string" },
     }, strict: true,
   });
   const options = optionsSchema.safeParse(args.values);
   if (!options.success) {
-    console.error("Live evaluation requires --allow-live --model <id> --max-requests <6..256> --output <new-directory> [--seed 42] [--repeats 1]. Use a credit-limited API key; a request cap is not a currency cap.");
+    console.error("Live evaluation requires --allow-live --model <id> --max-requests <6..256> --output <new-directory> [--suite coding|instructions] [--seed 42] [--repeats 1]. Use a credit-limited API key; a request cap is not a currency cap.");
     process.exitCode = 1;
     return;
   }
   const connection = parseCliConfiguration(["-p", "evaluation"], { apiKey: process.env.OPENROUTER_API_KEY, baseURL: process.env.OPENROUTER_BASE_URL });
   if (!connection.ok) { console.error(connection.error.message); process.exitCode = 1; return; }
   const image = process.env.NANO_AGENT_SANDBOX_IMAGE ?? "";
-  const tasks = codingEvaluationTasks(options.data.seed);
-  const plannedTrials = tasks.length * policies.length * options.data.repeats;
+  const tasks = options.data.suite === "instructions" ? instructionEvaluationTasks(options.data.seed) : codingEvaluationTasks(options.data.seed);
+  const selectedPolicies: readonly EvaluationPolicy[] = options.data.suite === "instructions" ? ["adjacent"] : policies;
+  const instructionPolicies = options.data.suite === "instructions" ? instructionTrialPolicies : [codingAgentInstructions];
+  const plannedTrials = tasks.length * selectedPolicies.length * instructionPolicies.length * options.data.repeats;
   const stepsPerTrial = Math.floor(options.data["max-requests"] / plannedTrials);
-  if (stepsPerTrial < 1) throw new Error("Evaluation request budget cannot cover every planned trial equally");
+  if (stepsPerTrial < 1) {
+    console.error("Live evaluation requires enough requests to cover every planned trial equally; instruction trials require at least 12 per repetition");
+    process.exitCode = 1;
+    return;
+  }
   const output = resolve(options.data.output);
   await mkdir(output, { mode: privateDirectoryMode }); // Exclusive: never mix experiments with prior evidence.
   const source = await fingerprintWorkspace(fileURLToPath(new URL("../", import.meta.url)));
@@ -194,7 +211,12 @@ async function runEvaluation(signal: AbortSignal): Promise<void> {
   const manifest = {
     schemaVersion: evaluationManifestVersion, model: options.data.model, image, bunVersion: Bun.version, appSourceSha256,
     seed: options.data.seed, repeats: options.data.repeats, plannedTrials, stepsPerTrial, maxRequests: options.data["max-requests"],
-    costUnit: "openrouter_credits", suite: "three starter fixtures; not a SOTA benchmark", startedAt: new Date().toISOString(),
+    costUnit: "openrouter_credits", suite: options.data.suite,
+    scope: "starter fixtures; not a SOTA benchmark or proof of general policy obedience",
+    instructionPromptVersions: instructionPolicies.map((instructions) => instructions.promptVersion),
+    sampling: "provider defaults; fixture seed does not make model outputs deterministic",
+    policyAssessment: options.data.suite === "instructions" ? "paired clean/injected coding trials; narrow automated probes plus required private trace review" : null,
+    startedAt: new Date().toISOString(),
   };
   await writeEvaluationArtifact(join(output, "manifest.json"), JSON.stringify(manifest, null, evaluationJsonIndentSpaces));
   const provider = new OpenRouterProvider(connection.value);
@@ -202,24 +224,32 @@ async function runEvaluation(signal: AbortSignal): Promise<void> {
     serial: { trials: 0, verified: 0, requests: 0, agentDurationMs: 0, costCredits: 0 },
     adjacent: { trials: 0, verified: 0, requests: 0, agentDurationMs: 0, costCredits: 0 },
   };
+  const instructionObservations: { task: string; repetition: number; promptVersion: string; codingVerified: boolean; probes: InstructionTrialGrade }[] = [];
   const totals: PolicyMeasurements = { trials: 0, verified: 0, requests: 0, agentDurationMs: 0, costCredits: 0 };
   for (let repetition = 0; repetition < options.data.repeats; repetition++) {
     for (const [index, task] of tasks.entries()) {
-      const orderedPolicies = (index + repetition) % policies.length === 0 ? policies : [...policies].reverse();
-      for (const policy of orderedPolicies) {
+      const orderedPolicies = (index + repetition) % policies.length === 0 ? selectedPolicies : [...selectedPolicies].reverse();
+      const orderedInstructions = (index + repetition) % policies.length === 0 ? instructionPolicies : [...instructionPolicies].reverse();
+      const variants = orderedPolicies.flatMap((policy) => orderedInstructions.map((instructions) => ({ policy, instructions })));
+      for (const { policy, instructions } of variants) {
         if (signal.aborted) break;
         const trial = await runEvaluationTrial({
-          directory: join(output, `${task.id}-${policy}-${repetition}`), task, policy, repetition,
+          directory: join(output, `${task.id}-${policy}-${instructions.promptVersion}-${repetition}`), task, policy, repetition,
+          instructions, suite: options.data.suite,
           model: options.data.model, image, maxAssistantSteps: stepsPerTrial, signal,
         }, provider);
         recordTrialMeasurements(byPolicy[policy], trial);
         recordTrialMeasurements(totals, trial);
+        if (trial.instructionGrade !== null) instructionObservations.push({ task: task.id, repetition,
+          promptVersion: instructions.promptVersion, codingVerified: trial.verified, probes: trial.instructionGrade });
         await writeEvaluationArtifact(join(output, "summary.json"), JSON.stringify({
           ...manifest, completedTrials: totals.trials, verifiedTasks: totals.verified, attemptedRequests: totals.requests,
           totalCostCredits: totals.costCredits,
           costCreditsPerVerifiedTask: totals.costCredits !== null && totals.verified > 0 ? totals.costCredits / totals.verified : null,
           complete: totals.trials === plannedTrials,
-          policySummaries: policies.map((policy) => summarizePolicy(policy, byPolicy[policy])),
+          // Scheduling summaries do not establish instruction effectiveness. Per-trial instruction grades stay separate.
+          policySummaries: selectedPolicies.map((policy) => summarizePolicy(policy, byPolicy[policy])),
+          instructionObservations,
         }, null, evaluationJsonIndentSpaces));
       }
     }

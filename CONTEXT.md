@@ -63,8 +63,24 @@ The complete retained sequence of entries along a branch, including earlier
 context windows.
 _Avoid_: Active context
 
+**Instruction contract**:
+Application-owned behavioral rules with an explicit prompt version, independent
+of conversation history.
+_Avoid_: User prompt, project guidance, handoff
+
+**Resolved instructions**:
+The instruction contract composed with executor capability facts for one lane.
+They remain separate from that lane's conversation messages.
+_Avoid_: Conversation entry, context handoff
+
+**Capability facts**:
+Application-owned descriptions of what an executor grants and how its effects
+persist, not permission grants themselves.
+_Avoid_: Tool output, model authority
+
 **Active context**:
-The conversation messages selected for the next model request.
+The conversation messages selected for the next model request, excluding resolved
+instructions.
 _Avoid_: Transcript, provider-owned conversation
 
 **Context window**:

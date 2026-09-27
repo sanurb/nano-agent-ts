@@ -4,7 +4,7 @@ import { dirname, isAbsolute, relative, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { toolCallIdSchema, type AgentToolCall } from "../agent/agent-message.ts";
-import { maxToolArgumentBytes, maxToolOutcomeCharacters, cancelledToolResult, failedToolResult, ToolExecutionError, type AgentToolExecutor, type ToolExecutionMode, type ToolExecutionResult, type ToolExecutionContext } from "../agent/tool-executor.ts";
+import { maxToolArgumentBytes, maxToolOutcomeCharacters, cancelledToolResult, failedToolResult, ToolExecutionError, type AgentToolExecutor, type ToolExecutionMode, type ToolExecutionResult, type ToolExecutionContext, type ToolCapabilityDescription } from "../agent/tool-executor.ts";
 import { runBoundedCommand } from "../shared/bounded-command.ts";
 import type { OperationResult } from "../shared/operation-result.ts";
 import { localTools } from "./local-tools.ts";
@@ -59,6 +59,15 @@ export class DockerToolExecutor implements AgentToolExecutor {
     const probe = await backend.invoke({ id: toolCallIdSchema.parse("sandbox-readiness"), name: "Bash", arguments: '{"command":"printf sandbox-ready"}' });
     if (!probe.ok || probe.value.status !== "success" || probe.value.content !== "sandbox-ready") return { ok: false, error: ToolExecutionError.sandboxUnavailable() };
     return scope;
+  }
+
+  /** Describe the actual per-invocation mount and lifecycle policy, without leaking host paths or image details. */
+  describeCapabilities(): readonly ToolCapabilityDescription[] {
+    return localTools.map(({ definition }) => ({ toolName: definition.name,
+      description: `${definition.name === "Edit" || definition.name === "Write"
+        ? "Workspace file mutation is granted through this tool and persists on the host workspace."
+        : "The workspace is mounted read-only; this tool cannot persist workspace changes."} Each call uses a fresh isolated container with no network, a read-only root filesystem, and writable ephemeral /tmp. Container state is discarded after the call; only granted workspace file mutations persist.${definition.name === "Bash" ? " Bash cannot edit workspace files; use granted Edit or Write tools. Checks that require writes must use ephemeral /tmp and cannot persist installations or shell state across calls." : ""}`,
+    }));
   }
 
   /** Modes come from the same built-in registrations used inside the image. */

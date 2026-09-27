@@ -1,12 +1,15 @@
 import type { AgentToolCall } from "./agent-message.ts";
 import type { ToolExecutionId, ToolExecutionJournal } from "./tool-execution-journal.ts";
-import { cancelledToolResult, ToolExecutionError, type AgentToolExecutor, type ToolExecutionMode, type ToolExecutionResult } from "./tool-executor.ts";
+import { cancelledToolResult, ToolExecutionError, type AgentToolExecutor, type ToolExecutionMode, type ToolExecutionResult, type ToolCapabilityDescription } from "./tool-executor.ts";
 
 /** Persist intent and outcomes around the existing executor; never replay uncertain effects automatically. */
 export class JournaledToolExecutor implements AgentToolExecutor {
   readonly #active = new Set<ToolExecutionId>();
   /** One wrapper is shared across lanes so live sibling intents are not mistaken for abandoned attempts. */
   constructor(private readonly executor: AgentToolExecutor, private readonly journal: ToolExecutionJournal) {}
+
+  /** Journaling preserves the underlying grants and capability descriptions. */
+  describeCapabilities(): readonly ToolCapabilityDescription[] { return this.executor.describeCapabilities?.() ?? []; }
 
   /** Journaling does not alter the tool's scheduling policy. */
   executionModeFor(name: string): ToolExecutionMode { return this.executor.executionModeFor(name); }

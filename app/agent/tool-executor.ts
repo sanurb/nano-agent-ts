@@ -105,8 +105,16 @@ export type ToolExecutionMode = "parallel" | "sequential";
 /** Runtime-assigned correlation, never part of model arguments or a grant of additional authority. */
 export interface ToolExecutionContext { readonly executionId: ToolExecutionId; }
 
+/** Application-owned executor facts, never sourced from model arguments or tool output; not authorization. */
+export interface ToolCapabilityDescription {
+  readonly toolName: string;
+  readonly description: string;
+}
+
 /** Injected tool execution; implementations own argument parsing, I/O, and safe failures. */
 export interface AgentToolExecutor {
+  /** Optional metadata: absent means unknown, not unrestricted. Wrappers must narrow facts with their grants. */
+  describeCapabilities?(): readonly ToolCapabilityDescription[];
   /** Read scheduling policy from the registered implementation, never from model arguments. */
   executionModeFor(toolName: string): ToolExecutionMode;
   /** Settle all owned I/O before returning, including cancellation; correctable failures are outcomes. */

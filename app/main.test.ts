@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { codingAgentInstructions } from "./agent/agent-instructions.ts";
 import type { CliEnvironment } from "./cli/cli-configuration.ts";
 
 const cliPath = fileURLToPath(new URL("./main.ts", import.meta.url));
 const testApiKey = "test-key-never-use-real-credentials";
+const systemMessage = { role: "system", content: expect.stringContaining(codingAgentInstructions.text) };
 
 async function runCli(args: readonly string[], environment: CliEnvironment, cwd = process.cwd(), mode: "sandbox" | "unsafe-local" | "default" = "unsafe-local") {
   const state = await mkdtemp(join(tmpdir(), "nano-agent-cli-state-"));
@@ -107,7 +109,9 @@ test("CLI advertises every local tool in wire order and prints only assistant te
   expect(request.authorization).toBe(`Bearer ${testApiKey}`);
   const payload = JSON.parse(request.body);
   expect(payload.model).toBe("anthropic/claude-haiku-4.5");
-  expect(payload.messages).toEqual([{ role: "user", content: prompt }]);
+  expect(payload.messages).toEqual([systemMessage, { role: "user", content: prompt }]);
+  expect(payload.messages[0].content).toContain("Unsafe-local shell runs with host user permissions");
+  expect(payload.messages[0].content).not.toContain("fresh isolated container");
   // Descriptions are prompt copy that interpolates the output limits; the wire contract is the envelope,
   // the advertised order, and each tool's parameter names.
   expect(payload.tools.map((advertised: any) => ({
@@ -172,6 +176,7 @@ test.each([
     const request = provider.requests[1];
     if (!request) throw new Error("Agent loop test missing continuation request");
     expect(JSON.parse(request.body).messages).toEqual([
+      systemMessage,
       { role: "user", content: "read strawberry.py" },
       toolResponse.choices[0]?.message,
       { role: "tool", tool_call_id: "read-call", content: expectedResult ?? content },
@@ -210,7 +215,7 @@ test("CLI follows README references across multiple agent-loop iterations", asyn
     expect(provider.requests).toHaveLength(4);
     for (const [index, request] of provider.requests.entries()) {
       expect(JSON.parse(request.body)).toMatchObject({
-        messages: [{ role: "user", content: prompt }, ...exchanges.slice(0, index).flatMap((exchange) => [exchange.assistant, exchange.tool])],
+        messages: [systemMessage, { role: "user", content: prompt }, ...exchanges.slice(0, index).flatMap((exchange) => [exchange.assistant, exchange.tool])],
       });
     }
   } finally {
@@ -294,6 +299,7 @@ test.each([
     const request = provider.requests[2];
     if (!request) throw new Error("Write test missing continuation request");
     expect(JSON.parse(request.body)).toMatchObject({ messages: [
+      systemMessage,
       { role: "user", content: prompt },
       readMessage,
       { role: "tool", tool_call_id: "instructions", content: instructions },
@@ -341,6 +347,7 @@ test("CLI executes Bash in the working directory and returns its output to the m
     const request = provider.requests[2];
     if (!request) throw new Error("Bash test missing continuation request");
     expect(JSON.parse(request.body)).toMatchObject({ messages: [
+      systemMessage,
       { role: "user", content: prompt },
       listMessage,
       { role: "tool", tool_call_id: "list-files", content: "README_old.md\n" },

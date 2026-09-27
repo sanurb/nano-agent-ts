@@ -272,7 +272,8 @@ test("an over-budget batch is recorded as non-executed before any effects", asyn
 
 test("context admission rejects oversized accumulated results without cutting call/result pairs", async () => {
   const { lane, provider } = await batchLane(batchCalls(["parallel"]), batchTools(async () => successfulToolResult("x".repeat(2048))));
-  expect(await lane.run("bounded", { maxContextBytes: 1024 })).toMatchObject({ ok: false, error: { resource: "context" } });
+  const instructionBytes = (await lane.getSnapshot()).instructionMetadata.utf8Bytes;
+  expect(await lane.run("bounded", { maxContextBytes: instructionBytes + 1024 })).toMatchObject({ ok: false, error: { resource: "context" } });
   expect(provider.requests).toHaveLength(1);
   expect((await lane.getSnapshot()).status).toBe("idle");
 });

@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import type { AgentToolCall } from "../agent/agent-message.ts";
-import { maxToolArgumentBytes, failedToolResult, ToolExecutionError, type AgentToolExecutor, type ToolExecutionMode, type ToolExecutionResult, type ToolExecutionContext } from "../agent/tool-executor.ts";
+import { maxToolArgumentBytes, failedToolResult, ToolExecutionError, type AgentToolExecutor, type ToolExecutionMode, type ToolExecutionResult, type ToolExecutionContext, type ToolCapabilityDescription } from "../agent/tool-executor.ts";
 import type { OperationResult } from "../shared/operation-result.ts";
 import { canonicalizeToolPath } from "./canonical-tool-path.ts";
 import { pathArgumentSchema } from "./tool-output.ts";
@@ -33,6 +33,15 @@ export class WorkspaceToolExecutor implements AgentToolExecutor {
     const homeWithinRoot = relative(canonical, home);
     if (!isAbsolute(homeWithinRoot) && homeWithinRoot !== ".." && !homeWithinRoot.startsWith(`..${sep}`)) return { ok: false, error: ToolExecutionError.policyDenied() };
     return { ok: true, value: new WorkspaceToolExecutor(canonical, executor, { ...grants }) };
+  }
+
+  /** Narrow descriptions with the same grants used for dispatch; shell access is not a host path sandbox. */
+  describeCapabilities(): readonly ToolCapabilityDescription[] {
+    return (this.executor.describeCapabilities?.() ?? []).filter(({ toolName }) =>
+      toolName === "Bash" ? this.grants.shell
+        : (fileTools.has(toolName) || searchTools.has(toolName)) && (this.grants.write || (toolName !== "Edit" && toolName !== "Write")),
+    ).map((fact) => ({ ...fact, description: fact.toolName === "Bash" ? fact.description
+      : `${fact.description} File-tool paths are restricted to the granted workspace; ${fact.toolName === "Edit" || fact.toolName === "Write" ? "workspace file mutation is granted" : "this tool does not grant file mutation"}.` }));
   }
 
   /** Scheduling remains owned by the registered implementation. */
