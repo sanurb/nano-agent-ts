@@ -39,6 +39,8 @@ export OPENROUTER_API_KEY="YOUR_OPENROUTER_API_KEY"
 bun run dev -p "Read README.md and summarize the project."
 ```
 
+Skills in `.claude/skills/<name>/SKILL.md` are advertised to the model, which can load one with the Skill tool. Start a prompt with `/name` to invoke one directly; several leading `/name` words stack, and the text after them fills `$ARGUMENTS`, `$ARGUMENTS[n]`, and `$n`. A skill with `context: fork` runs in a fresh conversation and returns only its answer.
+
 Setting `NANO_AGENT_EXECUTION=unsafe-local` bypasses Docker and permits shell commands with your host user permissions; it is not isolation.
 
 For configuration, start with [CLI input](app/cli/cli-configuration.ts) and [execution configuration](app/cli/execution-configuration.ts). If startup reports unresolved tool executions, use the [journal CLI](app/cli/journal-main.ts) to inspect and reconcile them. Do not delete the journal to bypass recovery.
@@ -52,6 +54,7 @@ For configuration, start with [CLI input](app/cli/cli-configuration.ts) and [exe
 | Lane ownership and concurrency | [agent-harness.ts](app/agent/agent-harness.ts), [tests](app/agent/agent-harness.test.ts) |
 | Agent loop and tool scheduling | [agent-lane.ts](app/agent/agent-lane.ts), [batch tests](app/agent/tool-batch.test.ts) |
 | Instruction admission, policy, and composition | [agent-instructions.ts](app/agent/agent-instructions.ts), [delivery tests](app/agent/agent-instructions.test.ts) |
+| Skills: discovery, invocation, and forking | [app/skills/](app/skills/), [skill-tool.ts](app/skills/skill-tool.ts) |
 | Provider integration | [openrouter-provider.ts](app/providers/openrouter-provider.ts) |
 | Tool registration and execution | [local-tools.ts](app/tools/local-tools.ts), [app/tools/](app/tools/) |
 | File mutation coordination | [file-mutation-queue.ts](app/tools/file-mutation-queue.ts), [atomic-file-mutation.ts](app/tools/atomic-file-mutation.ts) |

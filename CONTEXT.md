@@ -69,7 +69,8 @@ of conversation history.
 _Avoid_: User prompt, project guidance, handoff
 
 **Resolved instructions**:
-The instruction contract composed with executor capability facts for one lane.
+The instruction contract composed with executor capability facts, and any project
+guidance, for one lane.
 They remain separate from that lane's conversation messages.
 _Avoid_: Conversation entry, context handoff
 
@@ -77,6 +78,21 @@ _Avoid_: Conversation entry, context handoff
 Application-owned descriptions of what an executor grants and how its effects
 persist, not permission grants themselves.
 _Avoid_: Tool output, model authority
+
+**Project guidance**:
+Lower-priority instruction text sourced from project files, such as the skill
+catalog. Project content, not authority.
+_Avoid_: Instruction contract, application rules
+
+**Skill**:
+A project folder whose `SKILL.md` names and describes a task. Only the name and
+description are advertised up front; the instructions load when the skill is invoked.
+_Avoid_: Tool, plugin
+
+**Forked skill**:
+A skill that runs on a new lane whose conversation holds only its instructions.
+Only its final answer returns to the conversation that invoked it.
+_Avoid_: Subagent, child process
 
 **Active context**:
 The conversation messages selected for the next model request, excluding resolved

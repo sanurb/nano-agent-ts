@@ -5,8 +5,14 @@ import { createExecutionConfiguration } from "./cli/execution-configuration.ts";
 import { renderTerminalText } from "./cli/terminal-text.ts";
 import { OpenRouterProvider } from "./providers/openrouter-provider.ts";
 import { SqliteExecutionJournal } from "./session/sqlite-execution-journal.ts";
+import { createForkedSkillRunner } from "./skills/forked-skill.ts";
+import { discoverSkills, projectSkillsDirectory } from "./skills/skill-catalog.ts";
+import { expandSkillInvocations } from "./skills/skill-invocation.ts";
+import { createSkillTool, skillCatalogGuidance, SkillToolExecutor, skillToolDefinition } from "./skills/skill-tool.ts";
 import { localTools } from "./tools/local-tools.ts";
 import { interruptedExitCode, processArgumentOffset, terminatedExitCode } from "./shared/process-policy.ts";
+
+const agentModel = "anthropic/claude-haiku-4.5";
 
 async function runAgentCli(): Promise<void> {
   const configuration = parseCliConfiguration(process.argv.slice(processArgumentOffset), {
@@ -19,6 +25,8 @@ async function runAgentCli(): Promise<void> {
     journalPath: process.env.NANO_AGENT_JOURNAL_PATH,
   });
   if (!execution.ok) { console.error(execution.error.message); process.exitCode = 1; return; }
+  const skills = await discoverSkills(projectSkillsDirectory);
+  if (!skills.ok) { console.error(skills.error.message); process.exitCode = 1; return; }
   const journal = await SqliteExecutionJournal.open(execution.value.journalPath);
   if (!journal.ok) { console.error(journal.error.message); process.exitCode = 1; return; }
   const cancellation = new AbortController();
@@ -35,13 +43,20 @@ async function runAgentCli(): Promise<void> {
       return;
     }
     const provider = new OpenRouterProvider(configuration.value);
+    const localToolDefinitions = localTools.map((tool) => tool.definition);
+    // A fork gets the local tools but not Skill, so a forked skill cannot fork again.
+    const runForkedSkill = createForkedSkillRunner(() => harness, { model: agentModel, tools: localToolDefinitions });
+    const executor = new SkillToolExecutor(execution.value.executor, createSkillTool(skills.value, runForkedSkill));
     const harness = new AgentHarness(provider, {
-      model: "anthropic/claude-haiku-4.5", tools: localTools.map((tool) => tool.definition),
+      model: agentModel,
+      tools: skills.value.length > 0 ? [...localToolDefinitions, skillToolDefinition] : localToolDefinitions,
+      projectGuidance: skillCatalogGuidance(skills.value),
       entryIds: { next: () => Bun.randomUUIDv7() },
-    }, new JournaledToolExecutor(execution.value.executor, journal.value));
+    }, new JournaledToolExecutor(executor, journal.value));
     const lane = await harness.lane("main");
     if (!lane.ok) { console.error(lane.error.message); process.exitCode = 1; return; }
-    const result = await lane.value.run(configuration.value.prompt, { signal: cancellation.signal });
+    const prompts = expandSkillInvocations(configuration.value.prompt, skills.value);
+    const result = await lane.value.run(prompts, { signal: cancellation.signal });
     if (!result.ok) {
       console.error(result.error.message);
       process.exitCode = result.error._tag === "AgentRunCancelled" ? cancellationExitCode : 1;

@@ -585,3 +585,93 @@ test.each(["not a url", "file:///etc/passwd", ""])('CLI rejects invalid base URL
     exitCode: 1,
   });
 });
+
+async function withSkillProject(skills: Readonly<Record<string, string>>, run: (directory: string) => Promise<void>): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "nano-agent-skills-cli-"));
+  try {
+    for (const [name, document] of Object.entries(skills)) {
+      await mkdir(join(directory, ".claude", "skills", name), { recursive: true });
+      await writeFile(join(directory, ".claude", "skills", name, "SKILL.md"), document);
+    }
+    await run(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+const skillLocation = (name: string) =>
+  `Skill: ${name} (located at .claude/skills/${name})\nPaths in the instructions below are relative to that folder.\n\n`;
+const wireToolNames = (payload: { tools: readonly { function: { name: string } }[] }) => payload.tools.map((tool) => tool.function.name);
+
+test("CLI expands stacked slash skills into one user message each, sharing the trailing arguments", async () => {
+  await withSkillProject({
+    apple: "---\nname: apple\ndescription: Reports the apple deploy target.\n---\n\nAdd this exact line: blueberry-$ARGUMENTS\n",
+    grape: "---\nname: grape\ndescription: Summarizes grape incidents.\n---\n\nAdd this exact line: cherry-$1-$0\n",
+    kiwi: "---\nname: kiwi\ndescription: Never invoked.\n---\n\nAdd this exact line: decoy\n",
+  }, async (directory) => {
+    using provider = new LocalCompletionServer(completionBody("blueberry-4127 x\ncherry-x-4127"));
+    expect(await runCli(["-p", "/apple /grape 4127 x"], { apiKey: testApiKey, baseURL: provider.baseURL }, directory)).toEqual({
+      stdout: "blueberry-4127 x\ncherry-x-4127\n", stderr: "", exitCode: 0,
+    });
+    const [request] = provider.requests;
+    if (!request) throw new Error("stacked skills test missing request");
+    const payload = JSON.parse(request.body);
+    expect(payload.messages).toEqual([
+      systemMessage,
+      { role: "user", content: `${skillLocation("apple")}Add this exact line: blueberry-4127 x` },
+      { role: "user", content: `${skillLocation("grape")}Add this exact line: cherry-x-4127` },
+    ]);
+    expect(payload.messages[0].content).toEndWith(
+      "- apple: Reports the apple deploy target.\n- grape: Summarizes grape incidents.\n- kiwi: Never invoked.\n\n"
+        + "If a skill matches the user's request, call the Skill tool with its name\nand follow the instructions it returns.",
+    );
+    expect(payload.messages[0].content).not.toContain("decoy");
+    expect(wireToolNames(payload)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash", "Skill"]);
+  });
+});
+
+test("CLI runs a model-chosen forked skill in a fresh conversation that never sees the triggering question", async () => {
+  await withSkillProject({
+    apple: "---\nname: apple\ndescription: Use when the user asks about the on-call rotation.\ncontext: fork\n---\n\nRespond with exactly one word: blueberry\n",
+    grape: "---\nname: grape\ndescription: Use when the user asks to format code.\n---\n\nRespond with: decoy\n",
+  }, async (directory) => {
+    const skillCall = {
+      role: "assistant", content: null,
+      tool_calls: [{ id: "use-skill", type: "function", function: { name: "Skill", arguments: '{"name":"apple"}' } }],
+    };
+    using provider = new LocalCompletionServer([
+      JSON.stringify({ choices: [{ finish_reason: "tool_calls", message: skillCall }] }),
+      completionBody("blueberry"),
+      completionBody("The on-call engineer is blueberry."),
+    ]);
+    const prompt = "Who is on the on-call rotation right now?";
+    expect(await runCli(["-p", prompt], { apiKey: testApiKey, baseURL: provider.baseURL }, directory)).toEqual({
+      stdout: "The on-call engineer is blueberry.\n", stderr: "", exitCode: 0,
+    });
+    const [, fork, resumed] = provider.requests.map((request) => JSON.parse(request.body));
+    expect(fork.messages).toEqual([
+      systemMessage,
+      { role: "user", content: `${skillLocation("apple")}Respond with exactly one word: blueberry` },
+    ]);
+    expect(fork.messages[0].content).not.toContain("You have access to the following skills");
+    expect(wireToolNames(fork)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash"]);
+    expect(resumed.messages).toMatchObject([
+      systemMessage,
+      { role: "user", content: prompt },
+      skillCall,
+      { role: "tool", tool_call_id: "use-skill", content: "Skill apple ran in a separate context and returned: blueberry" },
+    ]);
+  });
+});
+
+test("CLI reports a malformed skill without contacting the provider", async () => {
+  await withSkillProject({ apple: "no frontmatter" }, async (directory) => {
+    using provider = new LocalCompletionServer([]);
+    expect(await runCli(["-p", "/apple"], { apiKey: testApiKey, baseURL: provider.baseURL }, directory)).toEqual({
+      stdout: "",
+      stderr: "Skill discovery failed: a SKILL.md lacks UTF-8 YAML frontmatter with a name and description\n",
+      exitCode: 1,
+    });
+    expect(provider.requests).toEqual([]);
+  });
+});
