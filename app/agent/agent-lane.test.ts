@@ -241,6 +241,19 @@ test("run without an executor and empty prompts fail admission without accepting
   if (!main.ok) throw main.error;
   expect(await main.value.run("hello")).toMatchObject({ ok: false, error: { reason: "missing_executor" } });
   expect(await main.value.run("")).toMatchObject({ ok: false, error: { reason: "empty_prompt" } });
+  expect(await main.value.run([])).toMatchObject({ ok: false, error: { reason: "empty_prompt" } });
+  expect(await main.value.run(["first", ""])).toMatchObject({ ok: false, error: { reason: "empty_prompt" } });
   expect((await main.value.getSnapshot()).transcript).toEqual([]);
   expect(provider.requests).toHaveLength(0);
+});
+
+test("several prompts become consecutive user messages in one request", async () => {
+  const provider = new ScriptedAssistantProvider([assistantStep("both done")]);
+  const main = await createRunHarness(provider, new RecordingToolExecutor([])).lane("main");
+  if (!main.ok) throw main.error;
+  expect(await main.value.run(["first instructions", "second instructions"])).toEqual(assistantStep("both done"));
+  expect(provider.requests[0]?.messages).toEqual([
+    { role: "user", content: "first instructions" },
+    { role: "user", content: "second instructions" },
+  ]);
 });

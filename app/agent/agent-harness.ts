@@ -38,7 +38,7 @@ export class AgentHarness {
     private readonly toolExecutor: AgentToolExecutor | null = null,
   ) {
     this.#session = new ConversationSession(options.entryIds);
-    this.#seed = structuredClone({ model: options.model, tools: options.tools });
+    this.#seed = structuredClone({ model: options.model, tools: options.tools, projectGuidance: options.projectGuidance });
     this.#seedInstructions = AgentInstructions.parseContract(options.instructions === undefined ? codingAgentInstructions : options.instructions);
   }
 
@@ -55,12 +55,14 @@ export class AgentHarness {
     const configuration = options.configuration ?? this.#seed;
     const activeTools = new Set(configuration.tools.map((tool) => tool.name));
     const instructions = AgentInstructions.compose(configuration.instructions === undefined ? this.#seedInstructions.value : configuration.instructions,
-      (this.toolExecutor?.describeCapabilities?.() ?? []).filter((fact) => activeTools.has(fact.toolName)));
+      (this.toolExecutor?.describeCapabilities?.() ?? []).filter((fact) => activeTools.has(fact.toolName)),
+      configuration.projectGuidance);
     if (!instructions.ok) return instructions;
     const branch = this.#session.acquireBranch(parsed.data, options.createAt ?? null);
     if (!branch.ok) return branch;
     // No await between branch acquisition and publishing its single execution owner.
-    const lane = new AgentLane(branch.value, this.provider, { ...configuration, instructions: instructions.value }, this.toolExecutor);
+    const lane = new AgentLane(branch.value, this.provider,
+      { model: configuration.model, tools: configuration.tools, instructions: instructions.value }, this.toolExecutor);
     this.#lanes.set(parsed.data, lane);
     return { ok: true, value: lane };
   }

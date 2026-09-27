@@ -121,10 +121,15 @@ export interface AgentLaneConfiguration {
   readonly tools: readonly AgentToolDefinition[];
   /** Creation-only application rules; omission inherits captured harness defaults, never branch history. */
   readonly instructions?: AgentInstructionContract;
+  /**
+   * Lower-priority guidance sourced from project files, such as the skill catalog. Unlike the
+   * instruction contract it is never inherited: a lane created with its own configuration has none unless given.
+   */
+  readonly projectGuidance?: string | undefined;
 }
 
 /** Only admitted, composed instructions reach a lane's immutable runtime configuration. */
-export interface ResolvedAgentLaneConfiguration extends Omit<AgentLaneConfiguration, "instructions"> {
+export interface ResolvedAgentLaneConfiguration extends Omit<AgentLaneConfiguration, "instructions" | "projectGuidance"> {
   readonly instructions: AgentInstructions;
 }
 
@@ -162,7 +167,7 @@ export interface AgentLaneSnapshot {
   readonly name: string;
   readonly tipId: SessionEntryId | null;
   readonly status: "idle" | "requesting" | "awaiting_tools";
-  readonly configuration: Omit<AgentLaneConfiguration, "instructions">;
+  readonly configuration: Omit<AgentLaneConfiguration, "instructions" | "projectGuidance">;
   readonly instructionMetadata: InstructionMetadata;
   readonly runMetadata: AgentRunMetadata | null;
   readonly transcript: readonly ConversationEntry[];
@@ -208,9 +213,13 @@ export class AgentLane {
     }
   }
 
-  /** Own the model/tool loop, scheduling adjacent parallel tools without crossing a sequential barrier. */
-  async run(prompt: string, options: AgentRunOptions = {}): Promise<AgentRunResult> {
-    const admitted = this.admitRun(prompt, options);
+  /**
+   * Own the model/tool loop, scheduling adjacent parallel tools without crossing a sequential barrier.
+   * Several prompts become consecutive user messages, such as stacked skill instructions.
+   */
+  async run(prompt: string | readonly string[], options: AgentRunOptions = {}): Promise<AgentRunResult> {
+    const prompts = [prompt].flat();
+    const admitted = this.admitRun(prompts, options);
     if (!admitted.ok) return admitted;
     const { executor, maxAssistantSteps, limits } = admitted.value;
     const deadline = new AbortController();
@@ -222,7 +231,7 @@ export class AgentLane {
     this.#runMetadata = { instructions: this.#configuration.instructions.metadata, assistantRequests: 0 };
     this.#status = "requesting";
     try {
-      this.branch.appendMessage({ role: "user", content: prompt });
+      for (const text of prompts) this.branch.appendMessage({ role: "user", content: text });
       for (let step = 0; step < maxAssistantSteps; step++) {
         if (signal.aborted) return interruption();
         if (this.requestBytes(this.branch.getContext()) > limits.maxContextBytes) {
@@ -252,10 +261,10 @@ export class AgentLane {
     }
   }
 
-  private admitRun(prompt: string, options: AgentRunOptions): OperationResult<AdmittedAgentRun, LaneAdmissionError | AgentRunCancelled | AgentRunBudgetExceeded> {
+  private admitRun(prompts: readonly string[], options: AgentRunOptions): OperationResult<AdmittedAgentRun, LaneAdmissionError | AgentRunCancelled | AgentRunBudgetExceeded> {
     const rejected = this.admissionError();
     if (rejected) return { ok: false, error: rejected };
-    if (!prompt) return { ok: false, error: new LaneAdmissionError("empty_prompt") };
+    if (prompts.length === 0 || prompts.includes("")) return { ok: false, error: new LaneAdmissionError("empty_prompt") };
     const executor = this.toolExecutor;
     if (!executor) return { ok: false, error: new LaneAdmissionError("missing_executor") };
     const steps = assistantStepLimitSchema.safeParse(options.maxAssistantSteps ?? defaultAssistantSteps);
@@ -263,7 +272,8 @@ export class AgentLane {
     const limits = runLimitsSchema.safeParse(options);
     if (!limits.success) return { ok: false, error: new LaneAdmissionError("invalid_run_limits") };
     if (options.signal?.aborted) return { ok: false, error: new AgentRunCancelled() };
-    if (this.requestBytes([...this.branch.getContext(), { role: "user", content: prompt }]) > limits.data.maxContextBytes) return { ok: false, error: new AgentRunBudgetExceeded("context") };
+    const userMessages = prompts.map((content) => ({ role: "user", content }) as const);
+    if (this.requestBytes([...this.branch.getContext(), ...userMessages]) > limits.data.maxContextBytes) return { ok: false, error: new AgentRunBudgetExceeded("context") };
     return { ok: true, value: { executor, maxAssistantSteps: steps.data, limits: limits.data } };
   }
 
