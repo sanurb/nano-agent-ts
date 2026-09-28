@@ -15,7 +15,8 @@ import type {
   AssistantRequest,
   AssistantRequestResult,
 } from "./assistant-provider.ts";
-import { cancelledToolResult, failedToolResult, ToolExecutionError, type AgentToolExecutor, type ToolOutcome } from "./tool-executor.ts";
+import { AgentToolRuntime } from "./agent-tool-runtime.ts";
+import { cancelledToolResult, ToolExecutionError, type AgentToolExecutor, type ToolOutcome } from "./tool-executor.ts";
 
 const defaultAssistantSteps = 64;
 const defaultParallelTools = 4;
@@ -222,6 +223,8 @@ export class AgentLane {
     const admitted = this.admitRun(prompts, options);
     if (!admitted.ok) return admitted;
     const { executor, maxAssistantSteps, limits } = admitted.value;
+    const toolRuntime = new AgentToolRuntime(executor);
+    const activeToolNames = new Set(this.#configuration.tools.map((tool) => tool.name));
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), limits.maxDurationMs);
     const signal = options.signal ? AbortSignal.any([options.signal, deadline.signal]) : deadline.signal;
@@ -246,12 +249,20 @@ export class AgentLane {
           this.recordUnexecutedCalls(response.value.toolCalls, "Tool not executed: run tool-call budget exhausted.");
           return { ok: false, error: new AgentRunBudgetExceeded("tools") };
         }
-        const batch = await this.executeToolBatch(response.value.toolCalls, executor, limits.maxParallelTools, signal);
+        const batch = await toolRuntime.executeToolBatch(response.value.toolCalls, {
+          activeToolNames,
+          maxParallelTools: limits.maxParallelTools,
+          signal,
+          scopeId: this.name,
+          onOutcome: (call, outcome) => {
+            this.branch.appendMessage({ role: "tool", toolCallId: call.id, content: outcome.content });
+          },
+        });
         if (!batch.ok) return batch;
-        if (signal.aborted || batch.value.some((outcome) => outcome.status === "cancelled")) return interruption();
-        if (batch.value.some((outcome) => outcome.status === "uncertain")) return { ok: false, error: new AgentEffectUncertain() };
-        if (batch.value.length > 0 && batch.value.every((outcome) => outcome.terminate === true)) {
-          return { ok: true, value: { stopReason: "tool_termination", outcomes: batch.value } };
+        if (batch.value.status === "cancelled") return interruption();
+        if (batch.value.status === "uncertain") return { ok: false, error: new AgentEffectUncertain() };
+        if (batch.value.outcomes.length > 0 && batch.value.outcomes.every((outcome) => outcome.terminate === true)) {
+          return { ok: true, value: { stopReason: "tool_termination", outcomes: batch.value.outcomes } };
         }
       }
       return { ok: false, error: new AgentRunLimitExceeded(maxAssistantSteps) };
@@ -317,65 +328,6 @@ export class AgentLane {
       transcript: this.branch.getEntries(),
       context,
     };
-  }
-
-  /** Capture policy once; settle a whole group even on defects, then publish in source order. */
-  private async executeToolBatch(
-    calls: readonly AgentToolCall[],
-    executor: AgentToolExecutor,
-    maxParallelTools: number,
-    signal?: AbortSignal,
-  ): Promise<OperationResult<readonly ToolOutcome[], ToolExecutionError>> {
-    const scheduled = structuredClone(calls).map((call) => ({ call, mode: executor.executionModeFor(call.name) }));
-    if (!signal?.aborted && scheduled.some(({ call }) => !this.#configuration.tools.some((tool) => tool.name === call.name))) {
-      return { ok: false, error: ToolExecutionError.inactiveTool() };
-    }
-    const outcomes: ToolOutcome[] = [];
-    let cancelled = false;
-    let uncertain = false;
-    for (let start = 0; start < scheduled.length;) {
-      let end = start + 1;
-      if (scheduled[start]?.mode === "parallel") {
-        while (scheduled[end]?.mode === "parallel") end++;
-      }
-      // A rejecting promise must not release lane ownership while a sibling still owns an effect.
-      const group = scheduled.slice(start, end);
-      const execute = async (call: AgentToolCall) => {
-        try {
-          const result = cancelled || signal?.aborted ? cancelledToolResult()
-            : uncertain ? failedToolResult(ToolExecutionError.executionFailed("Tool batch", "tool not executed because a sibling effect requires reconciliation"))
-              : await executor.executeTool(call, signal);
-          if (result.ok && result.value.status === "cancelled") cancelled = true;
-          if (result.ok && result.value.status === "uncertain") uncertain = true;
-          return { status: "settled", call, result } as const;
-        } catch (error) {
-          return { status: "defect", error } as const;
-        }
-      };
-      const settled: Awaited<ReturnType<typeof execute>>[] = [];
-      let cursor = 0;
-      await Promise.all(Array.from({ length: Math.min(group.length, maxParallelTools) }, async () => {
-        for (;;) {
-          const index = cursor++;
-          const entry = group[index];
-          if (!entry) return;
-          settled[index] = await execute(entry.call);
-        }
-      }));
-      for (const entry of settled) {
-        if (entry.status === "settled" && entry.result.ok) {
-          outcomes.push(entry.result.value);
-          if (entry.result.value.status === "cancelled") cancelled = true;
-          this.branch.appendMessage({ role: "tool", toolCallId: entry.call.id, content: entry.result.value.content });
-        }
-      }
-      for (const entry of settled) {
-        if (entry.status === "defect") throw entry.error;
-        if (!entry.result.ok) return entry.result;
-      }
-      start = end;
-    }
-    return { ok: true, value: outcomes };
   }
 
   private createRequest(messages: readonly AgentMessage[]): AssistantRequest {

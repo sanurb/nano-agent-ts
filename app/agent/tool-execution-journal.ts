@@ -14,6 +14,8 @@ export type ToolExecutionId = z.infer<typeof toolExecutionIdSchema>;
 /** Durable evidence retains uncertainty rather than inventing an exactly-once effect guarantee. */
 export interface JournalInvocation {
   readonly id: ToolExecutionId;
+  /** Durable caller identity, or null for a model-issued root call. */
+  readonly parentExecutionId: ToolExecutionId | null;
   readonly call: AgentToolCall;
   readonly state: "started" | "settled" | "not_executed";
   readonly outcome: ToolOutcome | null;
@@ -33,7 +35,7 @@ export class ExecutionJournalError extends Error {
 
 /** Write intent before dispatch and outcome before releasing execution ownership. */
 export interface ToolExecutionJournal {
-  start(call: AgentToolCall): OperationResult<ToolExecutionId, ExecutionJournalError>;
+  start(call: AgentToolCall, parentExecutionId?: ToolExecutionId): OperationResult<ToolExecutionId, ExecutionJournalError>;
   finish(id: ToolExecutionId, outcome: ToolOutcome | null): OperationResult<void, ExecutionJournalError>;
   inspect(): OperationResult<readonly JournalInvocation[], ExecutionJournalError>;
   unresolved(): OperationResult<readonly ToolExecutionId[], ExecutionJournalError>;

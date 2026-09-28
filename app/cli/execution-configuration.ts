@@ -6,7 +6,9 @@ import type { AgentToolExecutor } from "../agent/tool-executor.ts";
 import type { OperationResult } from "../shared/operation-result.ts";
 import { DockerToolExecutor } from "../tools/docker-tool-executor.ts";
 import { LocalToolExecutor } from "../tools/local-tool-executor.ts";
+import { createLocalPythonCellRunner } from "../tools/local-python-cell-runner.ts";
 import { localTools } from "../tools/local-tools.ts";
+import type { PythonCellRunner } from "../tools/python-cell-tool.ts";
 import { WorkspaceToolExecutor } from "../tools/workspace-tool-executor.ts";
 import { canonicalizeToolPath } from "../tools/canonical-tool-path.ts";
 
@@ -36,6 +38,7 @@ export function defaultExecutionJournalPath(workspace: string): string {
 /** Construct fail-closed execution and private state placement before contacting any provider. */
 export async function createExecutionConfiguration(workspace: string, environment: ExecutionEnvironment): Promise<OperationResult<{
   readonly executor: AgentToolExecutor;
+  readonly pythonCellRunner: PythonCellRunner;
   readonly journalPath: string;
   readonly mode: "sandbox" | "unsafe-local";
 }, ExecutionConfigurationError>> {
@@ -47,9 +50,20 @@ export async function createExecutionConfiguration(workspace: string, environmen
   if (!path.ok) return { ok: false, error: new ExecutionConfigurationError() };
   const fromWorkspace = relative(root, path.value);
   if (!isAbsolute(fromWorkspace) && fromWorkspace !== ".." && !fromWorkspace.startsWith(`..${sep}`)) return { ok: false, error: new ExecutionConfigurationError() };
-  const executor = mode.data === "sandbox"
-    ? await DockerToolExecutor.create(root, environment.image ?? "")
-    : await WorkspaceToolExecutor.create(root, new LocalToolExecutor(localTools), { write: true, shell: true });
-  return executor.ok ? { ok: true, value: { executor: executor.value, journalPath: path.value, mode: mode.data } }
+  if (mode.data === "sandbox") {
+    const runtime = await DockerToolExecutor.createRuntime(root, environment.image ?? "");
+    return runtime.ok
+      ? { ok: true, value: {
+        executor: runtime.value.executor,
+        pythonCellRunner: runtime.value.pythonCellRunner,
+        journalPath: path.value,
+        mode: mode.data,
+      } }
+      : { ok: false, error: new ExecutionConfigurationError() };
+  }
+  const executor = await WorkspaceToolExecutor.create(root, new LocalToolExecutor(localTools), { write: true, shell: true });
+  const pythonCellRunner = createLocalPythonCellRunner();
+  return executor.ok && pythonCellRunner !== null
+    ? { ok: true, value: { executor: executor.value, pythonCellRunner, journalPath: path.value, mode: mode.data } }
     : { ok: false, error: new ExecutionConfigurationError() };
 }

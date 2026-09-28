@@ -1,13 +1,13 @@
 import type { z } from "zod";
 import type { AgentToolDefinition } from "../agent/assistant-provider.ts";
-import { maxToolArgumentBytes, cancelledToolResult, failedToolResult, ToolExecutionError, type ToolExecutionMode, type ToolExecutionResult } from "../agent/tool-executor.ts";
+import { maxToolArgumentBytes, cancelledToolResult, failedToolResult, ToolExecutionError, type ToolExecutionContext, type ToolExecutionMode, type ToolExecutionResult } from "../agent/tool-executor.ts";
 
 /** An advertised tool bound to its own argument parsing; dispatch supplies arguments, never routing. */
 export interface AgentTool {
   readonly definition: AgentToolDefinition;
   readonly executionMode: ToolExecutionMode;
   /** Parse untrusted argument text and perform the effect; expected failures are values. */
-  execute(argumentsText: string, signal?: AbortSignal): Promise<ToolExecutionResult>;
+  execute(argumentsText: string, signal?: AbortSignal, context?: ToolExecutionContext): Promise<ToolExecutionResult>;
 }
 
 /** Everything one tool contributes: how it is advertised, how it is admitted, and what it does. */
@@ -20,7 +20,7 @@ export interface AgentToolSpecification<Arguments> {
   /** Completes "expected …" in the rejection diagnostic; describes the contract, never the input. */
   readonly argumentsExpectation: string;
   /** Runs only on arguments that already satisfy the schema. */
-  run(args: Arguments, signal?: AbortSignal): Promise<ToolExecutionResult>;
+  run(args: Arguments, signal?: AbortSignal, context?: ToolExecutionContext): Promise<ToolExecutionResult>;
 }
 
 /** Bind one tool's parsing to its effect so adding a tool never touches dispatch. */
@@ -33,7 +33,7 @@ export function defineTool<Arguments>(specification: AgentToolSpecification<Argu
   return {
     definition: specification.definition,
     executionMode: specification.executionMode ?? "parallel",
-    async execute(argumentsText: string, signal?: AbortSignal): Promise<ToolExecutionResult> {
+    async execute(argumentsText: string, signal?: AbortSignal, context?: ToolExecutionContext): Promise<ToolExecutionResult> {
       if (signal?.aborted) return cancelledToolResult();
       if (Buffer.byteLength(argumentsText, "utf8") > maxToolArgumentBytes) return failedToolResult(ToolExecutionError.invalidArguments(specification.definition.name, "argument JSON within the 1MB input budget"));
       let argumentsValue: unknown;
@@ -45,7 +45,7 @@ export function defineTool<Arguments>(specification: AgentToolSpecification<Argu
       }
       const parsed = specification.argumentsSchema.safeParse(argumentsValue);
       if (!parsed.success) return reject();
-      return specification.run(parsed.data, signal);
+      return specification.run(parsed.data, signal, context);
     },
   };
 }

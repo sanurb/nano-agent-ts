@@ -78,8 +78,13 @@ export interface ToolOutcome {
   readonly terminate?: boolean;
 }
 
+/** Admission failure that stops a tool call before a model-correctable outcome exists. */
+export type ToolExecutionAdmissionError = ToolExecutionError<
+  "unsupported_tool" | "inactive_tool" | "policy_denied" | "sandbox_unavailable" | "recovery_required"
+>;
+
 /** Only admission failures use the error channel; implementation defects may reject. */
-export type ToolExecutionResult = OperationResult<ToolOutcome, ToolExecutionError<"unsupported_tool" | "inactive_tool" | "policy_denied" | "sandbox_unavailable" | "recovery_required">>;
+export type ToolExecutionResult = OperationResult<ToolOutcome, ToolExecutionAdmissionError>;
 
 /** Record successful tool output without mixing it with the executor's error channel. */
 export function successfulToolResult(content: string) {
@@ -102,8 +107,15 @@ export function cancelledToolResult() {
 /** Adjacent parallel calls may overlap; a sequential call is a barrier on both sides. */
 export type ToolExecutionMode = "parallel" | "sequential";
 
-/** Runtime-assigned correlation, never part of model arguments or a grant of additional authority. */
-export interface ToolExecutionContext { readonly executionId: ToolExecutionId; }
+/** Runtime-assigned effect lineage, never part of model arguments or a grant of additional authority. */
+export interface ToolExecutionContext {
+  /** Durable identity assigned by the journal before the effect begins. */
+  readonly executionId?: ToolExecutionId;
+  /** Active caller identity for a tool call issued by another tool. */
+  readonly parentExecutionId?: ToolExecutionId;
+  /** Agent lane that owns stateful execution resources such as persistent kernels. */
+  readonly scopeId?: string;
+}
 
 /** Application-owned executor facts, never sourced from model arguments or tool output; not authorization. */
 export interface ToolCapabilityDescription {

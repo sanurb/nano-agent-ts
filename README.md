@@ -7,10 +7,11 @@ A coding agent built with TypeScript and Bun. This is my project for learning ho
 - [Can work run concurrently in one session?](docs/adr/0002-session-branch-lane-ownership.md) Why run ownership belongs to lanes, the alternatives, and how this relates to Pi 2.
 - [Why not serialize the whole tool batch?](docs/adr/0001-adjacent-tool-groups.md) The trade-off between adjacent parallel groups and dependency scheduling.
 - [Why are instructions separate from conversation?](docs/adr/0003-lane-instruction-contract.md) Immutable policy, capability facts, and separate delivery/effectiveness verification.
+- [Why embed IPython behind the capability membrane?](docs/adr/0004-lane-ipython-kernel.md) Rich execution without giving model-written code host authority.
 
 ## Develop
 
-Use Bun on macOS or Linux, with `/bin/sh` available.
+Use Bun and [uv](https://docs.astral.sh/uv/) on macOS or Linux, with `/bin/sh` available. uv supplies the Python 3.11 runtime and installs the hash-pinned IPython dependencies on first use. The Docker sandbox image installs the same dependency lock during its build.
 
 ```sh
 git clone https://github.com/sanurb/nano-agent-ts.git
@@ -43,6 +44,21 @@ Skills in `.claude/skills/<name>/SKILL.md` are advertised to the model, which ca
 
 Setting `NANO_AGENT_EXECUTION=unsafe-local` bypasses Docker and permits shell commands with your host user permissions; it is not isolation.
 
+## IPython Eval
+
+`Eval` owns one persistent IPython kernel per agent lane. Cells run serially and retain variables, `In`/`Out` history, magics, shell syntax, rich MIME displays, and top-level `await`:
+
+```json
+{"action":"run","language":"python","code":"import asyncio\nawait asyncio.sleep(0)\n6 * 7"}
+{"action":"reset","language":"python"}
+```
+
+Model-written code can call the admitted read-only capabilities through `cap.read`, `cap.glob`, and `cap.grep`. Every nested call re-enters the normal scheduler and execution journal. The kernel never receives provider credentials, raw executors, or workspace mounts in sandbox mode.
+
+Rich text, HTML, JSON, SVG, and other JSON-compatible MIME bundles cross the framed protocol. Binary image payloads are retained as bounded MIME data and summarized in model-facing text. Interactive stdin is closed so `input()`, debuggers, and prompts cannot consume protocol frames.
+
+Reset, cancellation, timeout, output overflow, capability-call overflow, protocol loss, process exit, and the Docker kernel lease retire the entire generation. State is not replayed after a restart, and branch lanes never share a kernel. In `unsafe-local` mode, IPython and its shell magics have the host user's permissions.
+
 For configuration, start with [CLI input](app/cli/cli-configuration.ts) and [execution configuration](app/cli/execution-configuration.ts). If startup reports unresolved tool executions, use the [journal CLI](app/cli/journal-main.ts) to inspect and reconcile them. Do not delete the journal to bypass recovery.
 
 ## Find the code
@@ -57,6 +73,7 @@ For configuration, start with [CLI input](app/cli/cli-configuration.ts) and [exe
 | Skills: discovery, invocation, and forking | [app/skills/](app/skills/), [skill-tool.ts](app/skills/skill-tool.ts) |
 | Provider integration | [openrouter-provider.ts](app/providers/openrouter-provider.ts) |
 | Tool registration and execution | [local-tools.ts](app/tools/local-tools.ts), [app/tools/](app/tools/) |
+| Persistent IPython membrane | [python-cell-tool.ts](app/tools/python-cell-tool.ts), [python-cell-runner.py](app/tools/python-cell-runner.py), [ipython_cell_engine.py](app/tools/ipython_cell_engine.py) |
 | File mutation coordination | [file-mutation-queue.ts](app/tools/file-mutation-queue.ts), [atomic-file-mutation.ts](app/tools/atomic-file-mutation.ts) |
 | Tool evidence and recovery | [journaled-tool-executor.ts](app/agent/journaled-tool-executor.ts), [sqlite-execution-journal.ts](app/session/sqlite-execution-journal.ts) |
 | Evaluations | [app/evaluation/main.ts](app/evaluation/main.ts), [authorized instruction trials](docs/adr/0003-lane-instruction-contract.md#delivery-evidence-is-not-effectiveness-evidence) |

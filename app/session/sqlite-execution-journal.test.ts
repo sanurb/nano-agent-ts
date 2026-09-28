@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { JournaledToolExecutor } from "../agent/journaled-tool-executor.ts";
 import { toolCallIdSchema } from "../agent/agent-message.ts";
+import { toolExecutionIdSchema } from "../agent/tool-execution-journal.ts";
 import { successfulToolResult } from "../agent/tool-executor.ts";
 import { defineTool } from "../tools/agent-tool.ts";
 import { LocalToolExecutor } from "../tools/local-tool-executor.ts";
@@ -24,6 +26,69 @@ async function openJournal(path: string): Promise<SqliteExecutionJournal> {
 }
 
 const providerId = toolCallIdSchema.parse("provider-may-reuse-this-id");
+
+function createVersionOneJournal(path: string): Database {
+  const legacy = new Database(path, { create: true, strict: true });
+  legacy.exec(`PRAGMA application_id=1312900948; PRAGMA user_version=1;
+    CREATE TABLE journal_lease (singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, pid INTEGER NOT NULL);
+    CREATE TABLE tool_invocations (id TEXT PRIMARY KEY, call_json TEXT NOT NULL,
+      state TEXT NOT NULL CHECK(state IN ('started','settled','not_executed')), outcome_json TEXT);
+    CREATE TABLE tool_reconciliations (execution_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);`);
+  return legacy;
+}
+
+test("version one journals migrate without losing root calls and accept parent-linked children", async () => {
+  await withJournal(async (path) => {
+    const legacyId = toolExecutionIdSchema.parse("00000000-0000-4000-8000-000000000001");
+    const legacy = createVersionOneJournal(path);
+    legacy.query("INSERT INTO tool_invocations VALUES (?, ?, 'settled', ?)").run(
+      legacyId,
+      JSON.stringify({ id: providerId, name: "Read", arguments: "{}" }),
+      JSON.stringify({ status: "success", content: "legacy result" }),
+    );
+    legacy.close();
+
+    const journal = await openJournal(path);
+    try {
+      const parent = journal.start({ id: providerId, name: "Parent", arguments: "{}" });
+      if (!parent.ok) throw parent.error;
+      const child = journal.start({ id: providerId, name: "Child", arguments: "{}" }, parent.value);
+      if (!child.ok) throw child.error;
+      expect(journal.finish(child.value, { status: "success", content: "child result" }).ok).toBe(true);
+      expect(journal.finish(parent.value, { status: "success", content: "parent result" }).ok).toBe(true);
+
+      const entries = journal.inspect();
+      if (!entries.ok) throw entries.error;
+      expect(entries.value).toMatchObject([
+        { id: legacyId, parentExecutionId: null, outcome: { content: "legacy result" } },
+        { id: parent.value, parentExecutionId: null, call: { name: "Parent" } },
+        { id: child.value, parentExecutionId: parent.value, call: { name: "Child" } },
+      ]);
+    } finally {
+      journal.close();
+    }
+  });
+});
+
+test("a live version one lease blocks migration without changing its schema version", async () => {
+  await withJournal(async (path) => {
+    const legacy = createVersionOneJournal(path);
+    legacy.query("INSERT INTO journal_lease VALUES (1, ?, ?)").run("live-owner", process.pid);
+    legacy.close();
+
+    expect(await SqliteExecutionJournal.open(path)).toMatchObject({
+      ok: false,
+      error: { reason: "busy" },
+    });
+    const inspected = new Database(path, { readonly: true, strict: true });
+    try {
+      expect(z.object({ user_version: z.literal(1) }).parse(inspected.query("PRAGMA user_version").get()))
+        .toEqual({ user_version: 1 });
+    } finally {
+      inspected.close();
+    }
+  });
+});
 
 test("intent precedes the effect and complete outcome metadata survives reopen with distinct invocation identities", async () => {
   await withJournal(async (path) => {

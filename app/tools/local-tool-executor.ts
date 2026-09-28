@@ -1,5 +1,5 @@
 import type { AgentToolCall } from "../agent/agent-message.ts";
-import { ToolExecutionError, type AgentToolExecutor, type ToolExecutionMode, type ToolExecutionResult, type ToolCapabilityDescription } from "../agent/tool-executor.ts";
+import { ToolExecutionError, type AgentToolExecutor, type ToolExecutionContext, type ToolExecutionMode, type ToolExecutionResult, type ToolCapabilityDescription } from "../agent/tool-executor.ts";
 import type { AgentTool } from "./agent-tool.ts";
 
 /** Dispatch by advertised name without owning history, stdout, or automatic retries. */
@@ -26,9 +26,9 @@ export class LocalToolExecutor implements AgentToolExecutor {
   }
 
   /** Route to the named tool and let it parse its own arguments; misrouting is unrepresentable. */
-  async executeTool(call: AgentToolCall, signal?: AbortSignal): Promise<ToolExecutionResult> {
+  async executeTool(call: AgentToolCall, signal?: AbortSignal, context?: ToolExecutionContext): Promise<ToolExecutionResult> {
     const tool = this.#tools.get(call.name);
     if (!tool) return { ok: false, error: ToolExecutionError.unsupportedTool() };
-    return tool.execute(call.arguments, signal);
+    return tool.execute(call.arguments, signal, context);
   }
 }

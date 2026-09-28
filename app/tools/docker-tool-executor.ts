@@ -13,6 +13,9 @@ import { WorkspaceToolExecutor } from "./workspace-tool-executor.ts";
 import { validateSandboxWorkspace } from "./sandbox-workspace.ts";
 
 import { sandboxClientDeadlineMs } from "./sandbox-runtime-policy.ts";
+import { PythonKernelRegistry } from "./python-kernel-registry.ts";
+import type { PythonKernelCommand } from "./python-kernel-transport.ts";
+import type { PythonCellRunner } from "./python-cell-tool.ts";
 
 const dockerControlDeadlineMs = 10_000;
 // Unit-bearing Docker flags are kept whole and searchable as one named resource profile.
@@ -34,12 +37,35 @@ const responseSchema = z.discriminatedUnion("ok", [
   z.object({ ok: z.literal(false), error: z.object({ reason: z.enum(["unsupported_tool", "inactive_tool", "policy_denied"]) }) }),
 ]);
 
+/** Isolated tools plus the bridge runner that shares the same audited Docker backend. */
+export interface DockerToolRuntime {
+  readonly executor: AgentToolExecutor;
+  readonly pythonCellRunner: PythonCellRunner;
+}
+
 /** Isolate every tool in a digest-pinned local image; never mount credentials, host sockets, or the host root. */
-export class DockerToolExecutor implements AgentToolExecutor {
-  private constructor(private readonly root: string, private readonly image: string, private readonly docker: string, private readonly endpoint: string) {}
+export class DockerToolExecutor implements AgentToolExecutor, PythonCellRunner {
+  readonly #pythonKernels: PythonKernelRegistry;
+
+  private constructor(private readonly root: string, private readonly image: string, private readonly docker: string, private readonly endpoint: string) {
+    this.#pythonKernels = new PythonKernelRegistry({
+      capabilityDescription: "IPython persists per agent lane with rich displays, history, magics, and top-level await in a non-root container with no network, workspace mount, or credentials. State is lost on reset, interruption, process loss, the 30-minute kernel lease, or host exit.",
+      createCommand: (scopeId, generation) => this.pythonKernelCommand(scopeId, generation),
+    });
+  }
+
+  get capabilityDescription(): string {
+    return this.#pythonKernels.capabilityDescription;
+  }
 
   /** Verify a local Linux daemon and immutable prebuilt image before any provider or tool work. No automatic pulls. */
   static async create(workspace: string, image: string): Promise<OperationResult<AgentToolExecutor, ToolExecutionError<"sandbox_unavailable" | "policy_denied">>> {
+    const runtime = await DockerToolExecutor.createRuntime(workspace, image);
+    return runtime.ok ? { ok: true, value: runtime.value.executor } : runtime;
+  }
+
+  /** Build the ordinary executor and Python bridge over one verified Docker backend. */
+  static async createRuntime(workspace: string, image: string): Promise<OperationResult<DockerToolRuntime, ToolExecutionError<"sandbox_unavailable" | "policy_denied">>> {
     const docker = Bun.which("docker");
     const parsed = imageSchema.safeParse(image);
     const root = await realpath(workspace).then((value) => value, () => null);
@@ -58,7 +84,7 @@ export class DockerToolExecutor implements AgentToolExecutor {
     if (!scope.ok) return scope;
     const probe = await backend.invoke({ id: toolCallIdSchema.parse("sandbox-readiness"), name: "Bash", arguments: '{"command":"printf sandbox-ready"}' });
     if (!probe.ok || probe.value.status !== "success" || probe.value.content !== "sandbox-ready") return { ok: false, error: ToolExecutionError.sandboxUnavailable() };
-    return scope;
+    return { ok: true, value: { executor: scope.value, pythonCellRunner: backend } };
   }
 
   /** Describe the actual per-invocation mount and lifecycle policy, without leaking host paths or image details. */
@@ -89,6 +115,44 @@ export class DockerToolExecutor implements AgentToolExecutor {
       return this.invoke({ ...call, arguments: JSON.stringify({ ...parsed.data, [field]: `/workspace/${local.split(sep).join("/")}` }) }, signal, context);
     };
     return call.name === "Edit" || call.name === "Write" ? withFileMutationQueue(target.data, translate, signal) : translate(target.data);
+  }
+
+  /** Run one cell in the Docker kernel owned by its agent lane. */
+  async run(input: Parameters<PythonCellRunner["run"]>[0]): ReturnType<PythonCellRunner["run"]> {
+    return await this.#pythonKernels.run(input);
+  }
+
+  /** Retire one lane's Docker kernel and advance its generation. */
+  async reset(scopeId: string): Promise<number> {
+    return await this.#pythonKernels.reset(scopeId);
+  }
+
+  /** Retire every Docker kernel before releasing the journal and process. */
+  async close(): Promise<void> {
+    await this.#pythonKernels.close();
+  }
+
+  private pythonKernelCommand(_scopeId: string, generation: number): PythonKernelCommand {
+    const ownerNonce = randomUUID();
+    const name = `nano-agent-${ownerNonce}`;
+    return {
+      executable: this.docker,
+      arguments: [
+        "--host", this.endpoint,
+        "run", "--name", name, "--pull=never", "--interactive", "--network=none", "--read-only", "--restart=no",
+        "--log-driver=none", "--cap-drop=ALL", "--cap-add=SETUID", "--cap-add=SETGID",
+        "--security-opt=no-new-privileges", ...sandboxResourceFlags,
+        "--workdir", "/tmp",
+        "--label", "nano-agent.owner=python-kernel",
+        "--label", `nano-agent.kernel_generation=${generation}`,
+        "--label", `nano-agent.owner_nonce=${ownerNonce}`,
+        this.image, "bun", "/agent/app/tools/sandbox-supervisor.ts",
+        String(process.getuid?.()), String(process.getgid?.()), "python-kernel",
+      ],
+      cwd: this.root,
+      env: { PATH: `${dirname(this.docker)}:/usr/bin:/bin`, HOME: homedir(), LANG: "C.UTF-8" },
+      cleanup: () => this.removeOwnedContainer(name, ownerNonce),
+    };
   }
 
   private async verifyRuntimeImage(): Promise<boolean> {

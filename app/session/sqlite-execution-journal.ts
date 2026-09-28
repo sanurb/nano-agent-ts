@@ -11,7 +11,8 @@ import type { OperationResult } from "../shared/operation-result.ts";
 import { privateDirectoryMode, privateFileMode } from "../shared/file-permissions.ts";
 
 const journalApplicationId = 0x4e414754; // ASCII NAGT distinguishes this journal from arbitrary SQLite databases.
-const journalSchemaVersion = 1;
+const legacyJournalSchemaVersion = 1;
+const journalSchemaVersion = 2;
 const sqliteFileHeader = "SQLite format 3\u0000";
 const maxSqlitePageBytes = 65_536;
 const maxJournalBytes = 67_108_864; // 64 MiB hard page ceiling.
@@ -20,7 +21,14 @@ const maxJournalInvocations = 10_000;
 const invocationStorageExpansionFactor = 2; // Account conservatively for page/index overhead.
 const pendingOutcomeReserveBytes = 524_288; // 512 KiB per active or newly admitted invocation.
 const journalBusyTimeoutMs = 1000;
-const rowSchema = z.object({ id: toolExecutionIdSchema, call_json: z.string(), state: z.enum(["started", "settled", "not_executed"]), outcome_json: z.string().nullable(), reconciliation: z.string().nullable() });
+const rowSchema = z.object({
+  id: toolExecutionIdSchema,
+  parent_execution_id: toolExecutionIdSchema.nullable(),
+  call_json: z.string(),
+  state: z.enum(["started", "settled", "not_executed"]),
+  outcome_json: z.string().nullable(),
+  reconciliation: z.string().nullable(),
+});
 const callSchema = z.object({ id: toolCallIdSchema, name: z.string().min(1), arguments: z.string().max(maxToolArgumentCharacters) });
 const outcomeSchema = z.object({ status: z.enum(["success", "error", "cancelled", "uncertain"]), content: z.string().max(maxToolOutcomeCharacters), terminate: z.boolean().optional() });
 
@@ -47,21 +55,35 @@ export class SqliteExecutionJournal implements ToolExecutionJournal {
       database = new Database(path, { create: true, strict: true });
       const identity = z.object({ application_id: z.number().int() }).parse(database.query("PRAGMA application_id").get());
       const version = z.object({ user_version: z.number().int() }).parse(database.query("PRAGMA user_version").get());
-      if ((populated && identity.application_id !== journalApplicationId) || ![0, journalSchemaVersion].includes(version.user_version)) {
+      if ((populated && identity.application_id !== journalApplicationId)
+        || ![0, legacyJournalSchemaVersion, journalSchemaVersion].includes(version.user_version)) {
         database.close(); return { ok: false, error: new ExecutionJournalError("corrupt") };
       }
       await chmod(path, privateFileMode);
       const pageSize = z.object({ page_size: z.number().int().positive().max(maxSqlitePageBytes) }).parse(database.query("PRAGMA page_size").get());
       database.exec(`PRAGMA max_page_count=${Math.floor(maxJournalBytes / pageSize.page_size)};
-        PRAGMA application_id=${journalApplicationId}; PRAGMA user_version=${journalSchemaVersion};
+        PRAGMA application_id=${journalApplicationId};
         PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=${journalBusyTimeoutMs};
         CREATE TABLE IF NOT EXISTS journal_lease (singleton INTEGER PRIMARY KEY CHECK(singleton=1), owner TEXT NOT NULL, pid INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS tool_invocations (id TEXT PRIMARY KEY, call_json TEXT NOT NULL,
-          state TEXT NOT NULL CHECK(state IN ('started','settled','not_executed')), outcome_json TEXT);
+          state TEXT NOT NULL CHECK(state IN ('started','settled','not_executed')), outcome_json TEXT,
+          parent_execution_id TEXT);
         CREATE TABLE IF NOT EXISTS tool_reconciliations (execution_id TEXT PRIMARY KEY, evidence TEXT NOT NULL);`);
       const owner = randomUUID();
+      database.exec("BEGIN IMMEDIATE");
       const acquired = database.query("INSERT OR IGNORE INTO journal_lease VALUES (1, ?, ?)").run(owner, process.pid);
-      if (acquired.changes !== 1) { database.close(); return { ok: false, error: new ExecutionJournalError("busy") }; }
+      if (acquired.changes !== 1) {
+        database.exec("ROLLBACK");
+        database.close();
+        return { ok: false, error: new ExecutionJournalError("busy") };
+      }
+      if (version.user_version === legacyJournalSchemaVersion) {
+        database.exec(`ALTER TABLE tool_invocations ADD COLUMN parent_execution_id TEXT;
+          PRAGMA user_version=${journalSchemaVersion};`);
+      } else if (version.user_version === 0) {
+        database.exec(`PRAGMA user_version=${journalSchemaVersion};`);
+      }
+      database.exec("COMMIT");
       return { ok: true, value: new SqliteExecutionJournal(database, owner) };
     } catch {
       database?.close();
@@ -70,7 +92,7 @@ export class SqliteExecutionJournal implements ToolExecutionJournal {
   }
 
   /** Persist a fresh execution ID before any external effect; cap retained records rather than silently deleting history. */
-  start(call: AgentToolCall): OperationResult<ToolExecutionId, ExecutionJournalError> {
+  start(call: AgentToolCall, parentExecutionId?: ToolExecutionId): OperationResult<ToolExecutionId, ExecutionJournalError> {
     try {
       const serialized = JSON.stringify(callSchema.parse(call));
       const count = z.object({ count: z.number(), active: z.number() }).parse(this.database.query("SELECT count(*) AS count, coalesce(sum(state='started'),0) AS active FROM tool_invocations").get());
@@ -84,9 +106,14 @@ export class SqliteExecutionJournal implements ToolExecutionJournal {
         return { ok: false, error: new ExecutionJournalError("unavailable") };
       }
       const id = toolExecutionIdSchema.parse(randomUUID());
-      this.database.query("INSERT INTO tool_invocations VALUES (?, ?, 'started', NULL)").run(id, serialized);
+      this.database.query(`INSERT INTO tool_invocations
+        (id, call_json, state, outcome_json, parent_execution_id) VALUES (?, ?, 'started', NULL, ?)`)
+        .run(id, serialized, parentExecutionId ?? null);
       return { ok: true, value: id };
-    } catch { return { ok: false, error: new ExecutionJournalError("unavailable") }; }
+    } catch (error) {
+      if (error instanceof Error) return { ok: false, error: new ExecutionJournalError("unavailable") };
+      throw error;
+    }
   }
 
   /** Commit the complete outcome before the scheduler publishes its ordered conversation message; null means admission denied. */
@@ -113,7 +140,14 @@ export class SqliteExecutionJournal implements ToolExecutionJournal {
           outcome = terminate === undefined ? value : { ...value, terminate };
         }
         if ((row.state === "settled") !== (outcome !== null)) return { ok: false, error: new ExecutionJournalError("corrupt") };
-        entries.push({ id: row.id, call, state: row.state, outcome, reconciliation: row.reconciliation });
+        entries.push({
+          id: row.id,
+          parentExecutionId: row.parent_execution_id,
+          call,
+          state: row.state,
+          outcome,
+          reconciliation: row.reconciliation,
+        });
       }
       return { ok: true, value: entries };
     } catch { return { ok: false, error: new ExecutionJournalError("corrupt") }; }
@@ -163,10 +197,15 @@ export class SqliteExecutionJournal implements ToolExecutionJournal {
       if (!input) return { ok: true, value: undefined };
       const { pid, owner } = z.object({ pid: z.number().int().positive(), owner: z.string() }).parse(input);
       try { process.kill(pid, 0); return { ok: false, error: new ExecutionJournalError("busy") }; }
-      catch (error) { if (!z.object({ code: z.literal("ESRCH") }).safeParse(error).success) return { ok: false, error: new ExecutionJournalError("busy") }; }
+      catch (error) { // no-excuse-ok: catch -- Parse the platform error code; ESRCH alone proves the recorded process exited.
+        if (!z.object({ code: z.literal("ESRCH") }).safeParse(error).success) return { ok: false, error: new ExecutionJournalError("busy") };
+      }
       database.query("DELETE FROM journal_lease WHERE singleton=1 AND pid=? AND owner=?").run(pid, owner);
       return { ok: true, value: undefined };
-    } catch { return { ok: false, error: new ExecutionJournalError("unavailable") }; }
+    } catch (error) {
+      if (error instanceof Error) return { ok: false, error: new ExecutionJournalError("unavailable") };
+      throw error;
+    }
     finally { database?.close(); }
   }
 }

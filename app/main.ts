@@ -1,4 +1,5 @@
 import { AgentHarness } from "./agent/agent-harness.ts";
+import { AgentToolRuntime } from "./agent/agent-tool-runtime.ts";
 import { JournaledToolExecutor } from "./agent/journaled-tool-executor.ts";
 import { parseCliConfiguration } from "./cli/cli-configuration.ts";
 import { createExecutionConfiguration } from "./cli/execution-configuration.ts";
@@ -10,6 +11,7 @@ import { discoverSkills, projectSkillsDirectory } from "./skills/skill-catalog.t
 import { expandSkillInvocations } from "./skills/skill-invocation.ts";
 import { createSkillTool, skillCatalogGuidance, SkillToolExecutor, skillToolDefinition } from "./skills/skill-tool.ts";
 import { localTools } from "./tools/local-tools.ts";
+import { evalToolDefinition, PythonCellToolExecutor } from "./tools/python-cell-tool.ts";
 import { interruptedExitCode, processArgumentOffset, terminatedExitCode } from "./shared/process-policy.ts";
 
 const agentModel = "anthropic/claude-haiku-4.5";
@@ -43,16 +45,26 @@ async function runAgentCli(): Promise<void> {
       return;
     }
     const provider = new OpenRouterProvider(configuration.value);
-    const localToolDefinitions = localTools.map((tool) => tool.definition);
+    const executionToolDefinitions = [...localTools.map((tool) => tool.definition), evalToolDefinition];
     // A fork gets the local tools but not Skill, so a forked skill cannot fork again.
-    const runForkedSkill = createForkedSkillRunner(() => harness, { model: agentModel, tools: localToolDefinitions });
-    const executor = new SkillToolExecutor(execution.value.executor, createSkillTool(skills.value, runForkedSkill));
+    const runForkedSkill = createForkedSkillRunner(() => harness, { model: agentModel, tools: executionToolDefinitions });
+    const skillExecutor = new SkillToolExecutor(execution.value.executor, createSkillTool(skills.value, runForkedSkill));
+    let toolRuntime: AgentToolRuntime | undefined;
+    const executor = new PythonCellToolExecutor(
+      skillExecutor,
+      execution.value.pythonCellRunner,
+      () => toolRuntime,
+    );
+    const journaledExecutor = new JournaledToolExecutor(executor, journal.value);
+    toolRuntime = new AgentToolRuntime(journaledExecutor);
     const harness = new AgentHarness(provider, {
       model: agentModel,
-      tools: skills.value.length > 0 ? [...localToolDefinitions, skillToolDefinition] : localToolDefinitions,
+      tools: skills.value.length > 0
+        ? [...executionToolDefinitions, skillToolDefinition]
+        : executionToolDefinitions,
       projectGuidance: skillCatalogGuidance(skills.value),
       entryIds: { next: () => Bun.randomUUIDv7() },
-    }, new JournaledToolExecutor(executor, journal.value));
+    }, journaledExecutor);
     const lane = await harness.lane("main");
     if (!lane.ok) { console.error(lane.error.message); process.exitCode = 1; return; }
     const prompts = expandSkillInvocations(configuration.value.prompt, skills.value);
@@ -64,6 +76,7 @@ async function runAgentCli(): Promise<void> {
   } finally {
     process.off("SIGINT", interrupt);
     process.off("SIGTERM", terminate);
+    await execution.value.pythonCellRunner.close();
     const closed = journal.value.close();
     if (!closed.ok) { console.error(closed.error.message); process.exitCode = 1; }
   }

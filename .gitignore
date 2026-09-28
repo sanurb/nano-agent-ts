@@ -1,1 +1,4 @@
 node_modules/
+.omo/
+__pycache__/
+*.py[cod]

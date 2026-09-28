@@ -90,6 +90,7 @@ const advertisedToolContract = [
   { name: "Edit", properties: ["file_path", "edits"], required: ["file_path", "edits"] },
   { name: "Write", properties: ["file_path", "content"], required: ["file_path", "content"] },
   { name: "Bash", properties: ["command"], required: ["command"] },
+  { name: "Eval", properties: ["action", "language", "code"], required: ["action", "language"] },
 ].map((tool) => ({ type: "function", described: true, parameterType: "object", ...tool }));
 
 test("CLI advertises every local tool in wire order and prints only assistant text", async () => {
@@ -626,7 +627,7 @@ test("CLI expands stacked slash skills into one user message each, sharing the t
         + "If a skill matches the user's request, call the Skill tool with its name\nand follow the instructions it returns.",
     );
     expect(payload.messages[0].content).not.toContain("decoy");
-    expect(wireToolNames(payload)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash", "Skill"]);
+    expect(wireToolNames(payload)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash", "Eval", "Skill"]);
   });
 });
 
@@ -654,7 +655,7 @@ test("CLI runs a model-chosen forked skill in a fresh conversation that never se
       { role: "user", content: `${skillLocation("apple")}Respond with exactly one word: blueberry` },
     ]);
     expect(fork.messages[0].content).not.toContain("You have access to the following skills");
-    expect(wireToolNames(fork)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash"]);
+    expect(wireToolNames(fork)).toEqual(["Read", "Glob", "Grep", "Edit", "Write", "Bash", "Eval"]);
     expect(resumed.messages).toMatchObject([
       systemMessage,
       { role: "user", content: prompt },
